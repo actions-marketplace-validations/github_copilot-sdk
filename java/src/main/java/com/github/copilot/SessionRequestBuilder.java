@@ -184,6 +184,7 @@ final class SessionRequestBuilder {
         if (config.isEnableMcpApps()) {
             request.setRequestMcpApps(true);
         }
+        request.setGitHubMcpToolConfig(config.getGitHubMcpToolConfig());
         if (config.getOnExitPlanMode() != null) {
             request.setRequestExitPlanMode(true);
         }
@@ -316,6 +317,7 @@ final class SessionRequestBuilder {
         if (config.isEnableMcpApps()) {
             request.setRequestMcpApps(true);
         }
+        request.setGitHubMcpToolConfig(config.getGitHubMcpToolConfig());
         if (config.getOnExitPlanMode() != null) {
             request.setRequestExitPlanMode(true);
         }
@@ -356,6 +358,7 @@ final class SessionRequestBuilder {
         if (config.getOnPermissionRequest() != null) {
             session.registerPermissionHandler(config.getOnPermissionRequest());
         }
+        session.setManagedSettingsEnabled(config.getEnableManagedSettings().orElse(false));
         if (config.getOnMcpAuthRequest() != null) {
             session.registerMcpAuthHandler(config.getOnMcpAuthRequest());
         }
@@ -406,6 +409,7 @@ final class SessionRequestBuilder {
         if (config.getOnPermissionRequest() != null) {
             session.registerPermissionHandler(config.getOnPermissionRequest());
         }
+        session.setManagedSettingsEnabled(config.getEnableManagedSettings().orElse(false));
         if (config.getOnMcpAuthRequest() != null) {
             session.registerMcpAuthHandler(config.getOnMcpAuthRequest());
         }

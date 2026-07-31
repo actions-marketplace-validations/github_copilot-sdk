@@ -783,7 +783,9 @@ public sealed partial class CopilotClient : IDisposable, IAsyncDisposable
             _logger,
             this);
         session.RegisterTools(config.Tools ?? []);
-        session.RegisterPermissionHandler(config.OnPermissionRequest);
+        session.RegisterPermissionHandler(
+            config.OnPermissionRequest,
+            config.EnableManagedSettings is true);
         session.RegisterMcpAuthHandler(config.OnMcpAuthRequest);
         session.RegisterCommands(config.Commands);
         session.RegisterElicitationHandler(config.OnElicitationRequest);
@@ -1198,6 +1200,7 @@ public sealed partial class CopilotClient : IDisposable, IAsyncDisposable
                 ToolFilterPrecedence: toolFilter.ToolFilterPrecedence,
                 ExpAssignments: config.ExpAssignments,
                 EnableManagedSettings: config.EnableManagedSettings,
+                GitHubMcpToolConfig: config.GitHubMcpToolConfig,
                 EnableGitHubTelemetryForwarding: _options.OnGitHubTelemetry != null ? true : null);
 
             var rpcTimestamp = Stopwatch.GetTimestamp();
@@ -1413,6 +1416,7 @@ public sealed partial class CopilotClient : IDisposable, IAsyncDisposable
                 ToolFilterPrecedence: toolFilter.ToolFilterPrecedence,
                 ExpAssignments: config.ExpAssignments,
                 EnableManagedSettings: config.EnableManagedSettings,
+                GitHubMcpToolConfig: config.GitHubMcpToolConfig,
                 EnableGitHubTelemetryForwarding: _options.OnGitHubTelemetry != null ? true : null);
 
             var rpcTimestamp = Stopwatch.GetTimestamp();
@@ -2766,7 +2770,8 @@ public sealed partial class CopilotClient : IDisposable, IAsyncDisposable
         OptionsUpdateToolFilterPrecedence? ToolFilterPrecedence = null,
         [property: JsonPropertyName("expAssignments")] CopilotExpAssignmentResponse? ExpAssignments = null,
         [property: JsonPropertyName("enableManagedSettings")] bool? EnableManagedSettings = null,
-        bool? EnableGitHubTelemetryForwarding = null);
+        bool? EnableGitHubTelemetryForwarding = null,
+        [property: JsonPropertyName("githubMcpToolConfig")] GitHubMcpToolConfig? GitHubMcpToolConfig = null);
 #pragma warning restore GHCP001
 
     internal record ToolDefinition(
@@ -2873,7 +2878,8 @@ public sealed partial class CopilotClient : IDisposable, IAsyncDisposable
         OptionsUpdateToolFilterPrecedence? ToolFilterPrecedence = null,
         [property: JsonPropertyName("expAssignments")] CopilotExpAssignmentResponse? ExpAssignments = null,
         [property: JsonPropertyName("enableManagedSettings")] bool? EnableManagedSettings = null,
-        bool? EnableGitHubTelemetryForwarding = null);
+        bool? EnableGitHubTelemetryForwarding = null,
+        [property: JsonPropertyName("githubMcpToolConfig")] GitHubMcpToolConfig? GitHubMcpToolConfig = null);
 #pragma warning restore GHCP001
 
     internal record ResumeSessionResponse(

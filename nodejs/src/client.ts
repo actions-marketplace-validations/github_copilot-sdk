@@ -1460,7 +1460,10 @@ export class CopilotClient {
                 this.connection!,
                 undefined,
                 this.onGetTraceContext,
-                { mcpAuthHandler: config.onMcpAuthRequest }
+                {
+                    mcpAuthHandler: config.onMcpAuthRequest,
+                    managedSettingsEnabled: config.enableManagedSettings,
+                }
             );
             s.registerTools(config.tools);
             s.registerCanvases(config.canvases);
@@ -1556,6 +1559,9 @@ export class CopilotClient {
                 requestUserInput: !!config.onUserInputRequest,
                 requestElicitation: !!config.onElicitationRequest,
                 ...(config.enableMcpApps ? { requestMcpApps: true } : {}),
+                ...(config.githubMcpToolConfig != null
+                    ? { githubMcpToolConfig: config.githubMcpToolConfig }
+                    : {}),
                 requestExitPlanMode: !!config.onExitPlanModeRequest,
                 requestAutoModeSwitch: !!config.onAutoModeSwitchRequest,
                 hooks: !!(config.hooks && Object.values(config.hooks).some(Boolean)),
@@ -1691,7 +1697,10 @@ export class CopilotClient {
             this.connection!,
             undefined,
             this.onGetTraceContext,
-            { mcpAuthHandler: config.onMcpAuthRequest }
+            {
+                mcpAuthHandler: config.onMcpAuthRequest,
+                managedSettingsEnabled: config.enableManagedSettings,
+            }
         );
         session.registerTools(config.tools);
         session.registerCanvases(config.canvases);
@@ -1791,6 +1800,9 @@ export class CopilotClient {
                 requestUserInput: !!config.onUserInputRequest,
                 requestElicitation: !!config.onElicitationRequest,
                 ...(config.enableMcpApps ? { requestMcpApps: true } : {}),
+                ...(config.githubMcpToolConfig != null
+                    ? { githubMcpToolConfig: config.githubMcpToolConfig }
+                    : {}),
                 requestExitPlanMode: !!config.onExitPlanModeRequest,
                 requestAutoModeSwitch: !!config.onAutoModeSwitchRequest,
                 hooks: !!(config.hooks && Object.values(config.hooks).some(Boolean)),
