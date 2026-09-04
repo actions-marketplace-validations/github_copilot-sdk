@@ -1,4 +1,4 @@
-﻿/*---------------------------------------------------------------------------------------------
+/*---------------------------------------------------------------------------------------------
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------------------------------------------*/
 
@@ -82,6 +82,7 @@ public sealed partial class CopilotSession : IAsyncDisposable
     private IReadOnlyList<OpenCanvasInstance> _openCanvases = Array.Empty<OpenCanvasInstance>();
 
     private int _isDisposed;
+    private string? _gitHubTokenProviderRegistrationId;
 
     /// <summary>
     /// Channel that serializes event dispatch. <see cref="DispatchEvent"/> enqueues;
@@ -203,6 +204,44 @@ public sealed partial class CopilotSession : IAsyncDisposable
         ((ICollection<KeyValuePair<string, CopilotSession>>)_parentClient._sessions).Remove(new(SessionId, this));
     }
 
+    /// <summary>
+    /// Stops the session's event consumer (<see cref="ProcessEventsAsync"/>) without
+    /// making an RPC. <see cref="CopilotClient.CreateSessionAsync"/> and
+    /// <see cref="CopilotClient.ResumeSessionAsync"/> use this on error paths where a
+    /// locally registered session fails before it can be returned to the caller:
+    /// <see cref="StartProcessingEvents"/> starts the consumer eagerly, and no caller
+    /// ever receives the failed session to dispose it. Safe to call more than once —
+    /// <see cref="ChannelWriter{T}.TryComplete"/> is idempotent.
+    /// </summary>
+    internal void CloseEventChannel()
+    {
+        _eventChannel.Writer.TryComplete();
+    }
+
+    /// <summary>
+    /// Removes the session from its parent client and stops its event consumer.
+    /// Used on session-creation/resume error paths where the session was registered
+    /// (and its event loop started) but never returned to the caller.
+    /// </summary>
+    internal void Unregister()
+    {
+        CloseEventChannel();
+        RemoveFromClient();
+    }
+
+    internal void SetGitHubTokenProviderRegistration(string registrationId)
+    {
+        _gitHubTokenProviderRegistrationId = registrationId;
+    }
+
+    internal void ReleaseGitHubTokenProviderRegistration()
+    {
+        if (Interlocked.Exchange(ref _gitHubTokenProviderRegistrationId, null) is { } registrationId)
+        {
+            _parentClient.UnregisterGitHubTokenProvider(registrationId);
+        }
+    }
+
     internal void StartProcessingEvents()
     {
         _ = ProcessEventsAsync();
@@ -263,7 +302,7 @@ public sealed partial class CopilotSession : IAsyncDisposable
     ///     Prompt = "Explain this code",
     ///     Attachments = new List&lt;Attachment&gt;
     ///     {
-    ///         new() { Type = "file", Path = "./Program.cs" }
+    ///         new AttachmentFile { Path = "./Program.cs", DisplayName = "Program.cs" }
     ///     }
     /// });
     /// </code>
@@ -357,7 +396,7 @@ public sealed partial class CopilotSession : IAsyncDisposable
                     }
                     break;
 
-                case SessionIdleEvent:
+                case SessionIdleEvent idleEvent when idleEvent.Data.Mode != SessionMode.Autopilot:
                     LoggingHelpers.LogTiming(_logger, LogLevel.Debug, null,
                         "CopilotSession.SendAndWaitAsync idle received. Elapsed={Elapsed}, SessionId={SessionId}",
                         totalTimestamp,
@@ -884,9 +923,16 @@ public sealed partial class CopilotSession : IAsyncDisposable
 
             if (arguments is JsonElement incomingJsonArgs)
             {
-                foreach (var prop in incomingJsonArgs.EnumerateObject())
+                if (incomingJsonArgs.ValueKind == JsonValueKind.Object)
                 {
-                    aiFunctionArgs[prop.Name] = prop.Value;
+                    foreach (var prop in incomingJsonArgs.EnumerateObject())
+                    {
+                        aiFunctionArgs[prop.Name] = prop.Value;
+                    }
+                }
+                else
+                {
+                    aiFunctionArgs[GetSingleParameterName(tool)] = incomingJsonArgs;
                 }
             }
 
@@ -927,6 +973,55 @@ public sealed partial class CopilotSession : IAsyncDisposable
                 // Connection already disposed — nothing we can do
             }
         }
+
+        static string GetSingleParameterName(AIFunction tool)
+        {
+            if (tool.JsonSchema.TryGetProperty("properties", out var properties) &&
+                properties.ValueKind == JsonValueKind.Object)
+            {
+                string? parameterName = null;
+                foreach (var property in properties.EnumerateObject())
+                {
+                    if (parameterName is not null)
+                    {
+                        parameterName = null;
+                        break;
+                    }
+
+                    parameterName = property.Name;
+                }
+
+                if (parameterName is not null)
+                {
+                    return parameterName;
+                }
+
+                if (tool.JsonSchema.TryGetProperty("required", out var required) &&
+                    required.ValueKind == JsonValueKind.Array)
+                {
+                    string? requiredParameterName = null;
+                    foreach (var requiredParameter in required.EnumerateArray())
+                    {
+                        if (requiredParameterName is not null)
+                        {
+                            requiredParameterName = null;
+                            break;
+                        }
+
+                        requiredParameterName = requiredParameter.GetString();
+                    }
+
+                    if (requiredParameterName is not null &&
+                        properties.TryGetProperty(requiredParameterName, out _))
+                    {
+                        return requiredParameterName;
+                    }
+                }
+            }
+
+            throw new ArgumentException(
+                $"Tool '{tool.Name}' received non-object arguments, but its schema does not define exactly one parameter or one required parameter.");
+        }
     }
 
     /// <summary>
@@ -954,7 +1049,7 @@ public sealed partial class CopilotSession : IAsyncDisposable
                 return;
             }
             var responseRpcTimestamp = Stopwatch.GetTimestamp();
-            await Rpc.Permissions.HandlePendingPermissionRequestAsync(requestId, decision);
+            await Rpc.Permissions.HandlePendingPermissionRequestAsync(requestId, decision, decision.DecisionContext);
             LoggingHelpers.LogTiming(_logger, LogLevel.Debug, null,
                 "CopilotSession.ExecutePermissionAndRespondAsync response sent successfully. Elapsed={Elapsed}, SessionId={SessionId}, RequestId={RequestId}",
                 responseRpcTimestamp,
@@ -963,7 +1058,7 @@ public sealed partial class CopilotSession : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Permission handler or response delivery failed. SessionId={SessionId}, RequestId={RequestId}", SessionId, requestId);
+            LogPermissionHandlerOrDeliveryFailed(ex, SessionId, requestId);
             try
             {
                 await Rpc.Permissions.HandlePendingPermissionRequestAsync(requestId, PermissionDecision.UserNotAvailable());
@@ -1364,7 +1459,10 @@ public sealed partial class CopilotSession : IAsyncDisposable
                 Required = elicitationParams.RequestedSchema.Required
             };
 
-            var result = await session.Rpc.Ui.ElicitationAsync(elicitationParams.Message, schema, cancellationToken);
+            var result = await session.Rpc.Ui.ElicitationAsync(
+                elicitationParams.Message,
+                schema,
+                cancellationToken: cancellationToken);
             return new ElicitationResult
             {
                 Action = result.Action,
@@ -1388,7 +1486,7 @@ public sealed partial class CopilotSession : IAsyncDisposable
                 Required = ["confirmed"]
             };
 
-            var result = await session.Rpc.Ui.ElicitationAsync(message, schema, cancellationToken);
+            var result = await session.Rpc.Ui.ElicitationAsync(message, schema, cancellationToken: cancellationToken);
             if (result.Action == UIElicitationResponseAction.Accept
                 && result.Content != null
                 && result.Content.TryGetValue("confirmed", out var val))
@@ -1422,7 +1520,7 @@ public sealed partial class CopilotSession : IAsyncDisposable
                 Required = ["selection"]
             };
 
-            var result = await session.Rpc.Ui.ElicitationAsync(message, schema, cancellationToken);
+            var result = await session.Rpc.Ui.ElicitationAsync(message, schema, cancellationToken: cancellationToken);
             if (result.Action == UIElicitationResponseAction.Accept
                 && result.Content != null
                 && result.Content.TryGetValue("selection", out var val))
@@ -1457,7 +1555,7 @@ public sealed partial class CopilotSession : IAsyncDisposable
                 Required = ["value"]
             };
 
-            var result = await session.Rpc.Ui.ElicitationAsync(message, schema, cancellationToken);
+            var result = await session.Rpc.Ui.ElicitationAsync(message, schema, cancellationToken: cancellationToken);
             if (result.Action == UIElicitationResponseAction.Accept
                 && result.Content != null
                 && result.Content.TryGetValue("value", out var val))
@@ -1611,6 +1709,11 @@ public sealed partial class CopilotSession : IAsyncDisposable
                 "userPromptSubmitted" => hooks.OnUserPromptSubmitted != null
                     ? await hooks.OnUserPromptSubmitted(
                         JsonSerializer.Deserialize(input.GetRawText(), SessionJsonContext.Default.UserPromptSubmittedHookInput)!,
+                        invocation)
+                    : null,
+                "userPromptTransformed" => hooks.OnUserPromptTransformed != null
+                    ? await hooks.OnUserPromptTransformed(
+                        JsonSerializer.Deserialize(input.GetRawText(), SessionJsonContext.Default.UserPromptTransformedHookInput)!,
                         invocation)
                     : null,
                 "sessionStart" => hooks.OnSessionStart != null
@@ -1790,7 +1893,7 @@ public sealed partial class CopilotSession : IAsyncDisposable
     /// The new model takes effect for the next message. Conversation history is preserved.
     /// </summary>
     /// <param name="model">Model ID to switch to (e.g., "gpt-5.4").</param>
-    /// <param name="reasoningEffort">Reasoning effort level (e.g., "low", "medium", "high", "xhigh").</param>
+    /// <param name="reasoningEffort">Reasoning effort level (e.g., "low", "medium", "high", "xhigh", "max").</param>
     /// <param name="modelCapabilities">Per-property overrides for model capabilities, deep-merged over runtime defaults.</param>
     /// <param name="cancellationToken">Optional cancellation token.</param>
     /// <example>
@@ -1825,14 +1928,14 @@ public sealed partial class CopilotSession : IAsyncDisposable
         ThrowIfDisposed();
 
         await Rpc.Model.SwitchToAsync(
-            model,
-            options.ReasoningEffort,
-            options.ReasoningSummary,
-            null,
-            options.ModelCapabilities,
-            options.ContextTier,
-            null,
-            cancellationToken);
+            modelId: model,
+            reasoningEffort: options.ReasoningEffort,
+            reasoningSummary: options.ReasoningSummary,
+            verbosity: null,
+            modelCapabilities: options.ModelCapabilities,
+            contextTier: options.ContextTier,
+            source: null,
+            cancellationToken: cancellationToken);
     }
 
     /// <summary>
@@ -1911,7 +2014,7 @@ public sealed partial class CopilotSession : IAsyncDisposable
             return;
         }
 
-        _eventChannel.Writer.TryComplete();
+        CloseEventChannel();
 
         try
         {
@@ -1928,6 +2031,7 @@ public sealed partial class CopilotSession : IAsyncDisposable
         }
         finally
         {
+            ReleaseGitHubTokenProviderRegistration();
             RemoveFromClient();
             GC.SuppressFinalize(this);
         }
@@ -1951,6 +2055,9 @@ public sealed partial class CopilotSession : IAsyncDisposable
 
     [LoggerMessage(Level = LogLevel.Debug, Message = "Failed to fetch tool metadata for {toolName}")]
     private partial void LogToolMetadataFetchFailed(Exception exception, string toolName);
+
+    [LoggerMessage(Level = LogLevel.Error, Message = "Permission handler or response delivery failed. SessionId={SessionId}, RequestId={RequestId}")]
+    private partial void LogPermissionHandlerOrDeliveryFailed(Exception exception, string sessionId, string requestId);
 
     internal record SendMessageRequest
     {
@@ -2033,5 +2140,7 @@ public sealed partial class CopilotSession : IAsyncDisposable
     [JsonSerializable(typeof(Attachment))]
     [JsonSerializable(typeof(UserPromptSubmittedHookInput))]
     [JsonSerializable(typeof(UserPromptSubmittedHookOutput))]
+    [JsonSerializable(typeof(UserPromptTransformedHookInput))]
+    [JsonSerializable(typeof(UserPromptTransformedHookOutput))]
     internal partial class SessionJsonContext : JsonSerializerContext;
 }

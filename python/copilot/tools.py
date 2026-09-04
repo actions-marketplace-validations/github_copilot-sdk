@@ -11,7 +11,11 @@ import inspect
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import date, datetime, time
+from decimal import Decimal
+from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, get_type_hints, overload
+from uuid import UUID
 
 from pydantic import BaseModel, ValidationError
 
@@ -82,6 +86,11 @@ class Tool:
     skip_permission: bool = False
     defer: Literal["auto", "never"] | None = None
     metadata: dict[str, Any] | None = None
+    #: When true, a successful call to this tool ends the agent turn: the
+    #: runtime halts instead of feeding the result back to the model for
+    #: another round. A failed call leaves the loop running so the model can
+    #: read the error and retry.
+    is_terminal: bool = False
 
 
 T = TypeVar("T", bound=BaseModel)
@@ -97,6 +106,7 @@ def define_tool(
     skip_permission: bool = False,
     defer: Literal["auto", "never"] | None = None,
     metadata: dict[str, Any] | None = None,
+    is_terminal: bool = False,
 ) -> Callable[[Callable[..., Any]], Tool]:
     pass
 
@@ -112,6 +122,7 @@ def define_tool(
     skip_permission: bool = False,
     defer: Literal["auto", "never"] | None = None,
     metadata: dict[str, Any] | None = None,
+    is_terminal: bool = False,
 ) -> Tool:
     pass
 
@@ -127,6 +138,7 @@ def define_tool(
     skip_permission: bool = False,
     defer: Literal["auto", "never"] | None = None,
     metadata: dict[str, Any] | None = None,
+    is_terminal: bool = False,
 ) -> Tool:
     pass
 
@@ -141,6 +153,7 @@ def define_tool(
     skip_permission: bool = False,
     defer: Literal["auto", "never"] | None = None,
     metadata: dict[str, Any] | None = None,
+    is_terminal: bool = False,
 ) -> Tool | Callable[[Callable[[Any, ToolInvocation], Any]], Tool]:
     """
     Define a tool with automatic JSON schema generation from Pydantic models.
@@ -193,6 +206,10 @@ def define_tool(
                     Keys are namespaced and not part of the stable public API; values
                     are not interpreted and may be recognized to inform host-specific
                     behavior. Unknown keys are preserved.
+        is_terminal: When True, a successful call to this tool ends the agent turn:
+                    the runtime halts instead of feeding the result back to the model
+                    for another round. A failed call leaves the loop running so the
+                    model can read the error and retry.
 
     Returns:
         A Tool instance
@@ -288,6 +305,7 @@ def define_tool(
             skip_permission=skip_permission,
             defer=defer,
             metadata=metadata,
+            is_terminal=is_terminal,
         )
 
     # If handler is provided, call decorator immediately
@@ -308,6 +326,7 @@ def define_tool(
             skip_permission=skip_permission,
             defer=defer,
             metadata=metadata,
+            is_terminal=is_terminal,
         )
 
     # Otherwise return decorator for @define_tool(...) usage
@@ -348,10 +367,18 @@ def _normalize_result(result: Any) -> ToolResult:
             result_type="success",
         )
 
-    # Everything else gets JSON-serialized (with Pydantic model support)
+    # Everything else gets JSON-serialized (with common Python and Pydantic values)
     def default(obj: Any) -> Any:
         if isinstance(obj, BaseModel):
-            return obj.model_dump()
+            return obj.model_dump(mode="json")
+        if isinstance(obj, (date, datetime, time)):
+            return obj.isoformat()
+        if isinstance(obj, (Decimal, UUID)):
+            return str(obj)
+        if isinstance(obj, Enum):
+            return obj.value
+        if isinstance(obj, set):
+            return list(obj)
         raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
     try:

@@ -2,6 +2,7 @@ package testharness
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -29,15 +30,18 @@ func CLIPath() string {
 			return
 		}
 
-		// Look for CLI in sibling nodejs directory's node_modules. As of CLI
-		// 1.0.64-1 the @github/copilot package is a thin loader; the runnable
-		// index.js ships in the installed platform package
-		// (e.g. @github/copilot-linux-x64).
-		base := RepoPath("nodejs", "node_modules", "@github")
-		matches, _ := filepath.Glob(filepath.Join(base, "copilot-*", "index.js"))
-		if len(matches) > 0 {
-			cliPath = matches[0]
-			return
+		npm := "npm"
+		if runtime.GOOS == "windows" {
+			npm = "npm.cmd"
+		}
+		command := exec.Command(npm, "run", "--silent", "prepare:runtime", "--", "--print-path")
+		command.Dir = RepoPath("nodejs")
+		output, err := command.Output()
+		if err == nil {
+			candidate := strings.TrimSpace(string(output))
+			if info, statErr := os.Stat(candidate); statErr == nil && !info.IsDir() {
+				cliPath = candidate
+			}
 		}
 	})
 	return cliPath
@@ -111,6 +115,16 @@ func SkipIfInProcess(t *testing.T, reason string) {
 	t.Helper()
 	if isInProcessTransport() {
 		t.Skipf("unsupported over the in-process (FFI) transport: %s", reason)
+	}
+}
+
+// SkipIfInProcessOnMacOS skips the test when E2E tests run under the in-process
+// (FFI) transport on macOS. Coverage is retained over stdio on every OS and
+// in-process on Linux and Windows.
+func SkipIfInProcessOnMacOS(t *testing.T, reason string) {
+	t.Helper()
+	if isInProcessTransport() && runtime.GOOS == "darwin" {
+		t.Skipf("unsupported over the in-process (FFI) transport on macOS: %s", reason)
 	}
 }
 

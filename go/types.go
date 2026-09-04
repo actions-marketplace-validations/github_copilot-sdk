@@ -129,6 +129,11 @@ type ClientOptions struct {
 	// location.
 	// Ignored when connecting to an existing runtime via [URIConnection].
 	BaseDirectory string
+	// BuiltinPluginDirectories contains absolute paths to trusted plugin
+	// directories bundled by the host. When non-empty, Start replaces the
+	// runtime's complete trusted built-in plugin directory set before sessions
+	// can be created.
+	BuiltinPluginDirectories []string
 	// LogLevel for the runtime. When empty (the default), the runtime
 	// uses its own default level; the SDK does not pass --log-level.
 	// Recognized values: "none", "error", "warning", "info", "debug", "all".
@@ -188,6 +193,13 @@ type ClientOptions struct {
 	// directory are accessible from GitHub web and mobile.
 	// Ignored when connecting to an existing runtime via [URIConnection].
 	EnableRemoteSessions bool
+	// ClientInfo declares the integrating application's identity, forwarded to the
+	// runtime on the `server.connect` handshake. Declaring it lets the
+	// telemetry the runtime emits on this connection be attributed to a
+	// consistent surface (the application and its Copilot integration) instead of
+	// the runtime's own build. All fields are optional; leave it nil to keep the
+	// runtime's default attribution.
+	ClientInfo *ClientInfo
 	// Mode controls the default tool surface and feature flags presented to
 	// sessions created by this client. The zero value ([ModeCopilotCli])
 	// matches legacy CLI defaults. Set to [ModeEmpty] to opt in to
@@ -197,6 +209,54 @@ type ClientOptions struct {
 	// SessionFS, or a [URIConnection] so the runtime has persistent storage
 	// for session state.
 	Mode ClientMode
+}
+
+// ClientInfo identifies the integrating application on the `server.connect` handshake.
+//
+// Declaring it lets the telemetry the runtime emits on the connection be
+// attributed to a single, consistent surface instead of the runtime's own
+// build. All fields are optional; an empty field is omitted from the handshake.
+type ClientInfo struct {
+	// ApplicationName is the name of the application using the SDK.
+	ApplicationName string
+	// ApplicationVersion is the version of the application using the SDK.
+	ApplicationVersion string
+	// IntegrationName optionally identifies a specific integration within the
+	// application, such as an extension or plugin.
+	IntegrationName string
+	// IntegrationVersion is the optional version of the named integration.
+	IntegrationVersion string
+}
+
+// toWire maps the public [ClientInfo] onto the generated connect wire shape,
+// omitting empty fields. It returns nil when no identity was supplied so the
+// caller drops the clientInfo field and keeps the runtime's default attribution.
+func (ci *ClientInfo) toWire() *rpc.ConnectClientInfo {
+	if ci == nil {
+		return nil
+	}
+	wire := &rpc.ConnectClientInfo{}
+	populated := false
+	if ci.ApplicationName != "" {
+		wire.EditorName = &ci.ApplicationName
+		populated = true
+	}
+	if ci.ApplicationVersion != "" {
+		wire.EditorVersion = &ci.ApplicationVersion
+		populated = true
+	}
+	if ci.IntegrationName != "" {
+		wire.ExtensionName = &ci.IntegrationName
+		populated = true
+	}
+	if ci.IntegrationVersion != "" {
+		wire.ExtensionVersion = &ci.IntegrationVersion
+		populated = true
+	}
+	if !populated {
+		return nil
+	}
+	return wire
 }
 
 // CloudSessionRepository is GitHub repository metadata associated with a cloud session.
@@ -378,6 +438,58 @@ type PermissionInvocation struct {
 	SessionID              string
 	ManagedSettingsEnabled bool
 }
+
+// PermissionDecisionContext describes how and where a permission decision was
+// reached. Attach it to a decision with [NewAttributedPermissionResult] so the runtime
+// can attribute auto-approval telemetry to the responding surface. It is
+// informational only and never changes permission behavior.
+//
+// Experimental: PermissionDecisionContext is part of an experimental API and
+// may change or be removed.
+type PermissionDecisionContext = rpc.PermissionDecisionContext
+
+// PermissionResponseCapability describes whether the responding client could
+// ask a user for a permission decision.
+type PermissionResponseCapability = rpc.PermissionResponseCapability
+
+const (
+	PermissionResponseCapabilityHeadless    = rpc.PermissionResponseCapabilityHeadless
+	PermissionResponseCapabilityInteractive = rpc.PermissionResponseCapabilityInteractive
+	PermissionResponseCapabilityNone        = rpc.PermissionResponseCapabilityNone
+)
+
+// PermissionDecisionOutcome describes the disposition of a permission request
+// as observed by the responding client.
+type PermissionDecisionOutcome = rpc.PermissionDecisionOutcome
+
+const (
+	PermissionDecisionOutcomeAutoApproved    = rpc.PermissionDecisionOutcomeAutoApproved
+	PermissionDecisionOutcomeAutopilotDenied = rpc.PermissionDecisionOutcomeAutopilotDenied
+	PermissionDecisionOutcomePromptedUser    = rpc.PermissionDecisionOutcomePromptedUser
+)
+
+// PermissionDecisionSource identifies the controlled reason or actor
+// responsible for a permission response.
+type PermissionDecisionSource = rpc.PermissionDecisionSource
+
+const (
+	PermissionDecisionSourceAssistedApproval   = rpc.PermissionDecisionSourceAssistedApproval
+	PermissionDecisionSourceHostPolicy         = rpc.PermissionDecisionSourceHostPolicy
+	PermissionDecisionSourceHumanResponse      = rpc.PermissionDecisionSourceHumanResponse
+	PermissionDecisionSourceUnattendedFallback = rpc.PermissionDecisionSourceUnattendedFallback
+)
+
+// PermissionDecisionSurface identifies the client surface that submitted a
+// permission response.
+type PermissionDecisionSurface = rpc.PermissionDecisionSurface
+
+const (
+	PermissionDecisionSurfaceAcp        = rpc.PermissionDecisionSurfaceAcp
+	PermissionDecisionSurfaceCopilotApp = rpc.PermissionDecisionSurfaceCopilotApp
+	PermissionDecisionSurfacePromptMode = rpc.PermissionDecisionSurfacePromptMode
+	PermissionDecisionSurfaceSDK        = rpc.PermissionDecisionSurfaceSDK
+	PermissionDecisionSurfaceTui        = rpc.PermissionDecisionSurfaceTui
+)
 
 // MCPAuthWwwAuthenticateParams contains parsed parameters from an MCP server's WWW-Authenticate response.
 type MCPAuthWwwAuthenticateParams struct {
@@ -679,6 +791,46 @@ type UserPromptSubmittedHookOutput struct {
 // UserPromptSubmittedHandler handles user-prompt-submitted hook invocations
 type UserPromptSubmittedHandler func(input UserPromptSubmittedHookInput, invocation HookInvocation) (*UserPromptSubmittedHookOutput, error)
 
+// UserPromptTransformedHookInput is the input for a user-prompt-transformed hook.
+type UserPromptTransformedHookInput struct {
+	SessionID         string    `json:"sessionId"`
+	Timestamp         time.Time `json:"-"`
+	WorkingDirectory  string    `json:"cwd"`
+	Prompt            string    `json:"prompt"`
+	TransformedPrompt string    `json:"transformedPrompt"`
+}
+
+// MarshalJSON implements json.Marshaler, emitting Timestamp as Unix milliseconds.
+func (h UserPromptTransformedHookInput) MarshalJSON() ([]byte, error) {
+	type alias UserPromptTransformedHookInput
+	return json.Marshal(&struct {
+		Timestamp int64 `json:"timestamp"`
+		alias
+	}{Timestamp: h.Timestamp.UnixMilli(), alias: alias(h)})
+}
+
+// UnmarshalJSON implements json.Unmarshaler, parsing Timestamp from Unix milliseconds.
+func (h *UserPromptTransformedHookInput) UnmarshalJSON(data []byte) error {
+	type alias UserPromptTransformedHookInput
+	aux := &struct {
+		Timestamp int64 `json:"timestamp"`
+		*alias
+	}{alias: (*alias)(h)}
+	if err := json.Unmarshal(data, aux); err != nil {
+		return err
+	}
+	h.Timestamp = time.UnixMilli(aux.Timestamp)
+	return nil
+}
+
+// UserPromptTransformedHookOutput is the output for a user-prompt-transformed hook.
+type UserPromptTransformedHookOutput struct {
+	ModifiedTransformedPrompt *string `json:"modifiedTransformedPrompt,omitempty"`
+}
+
+// UserPromptTransformedHandler handles user-prompt-transformed hook invocations.
+type UserPromptTransformedHandler func(input UserPromptTransformedHookInput, invocation HookInvocation) (*UserPromptTransformedHookOutput, error)
+
 // SessionStartHookInput is the input for a session-start hook
 type SessionStartHookInput struct {
 	SessionID        string    `json:"sessionId"`
@@ -899,15 +1051,16 @@ type HookInvocation struct {
 
 // SessionHooks configures hook handlers for a session
 type SessionHooks struct {
-	OnPreToolUse          PreToolUseHandler
-	OnPostToolUse         PostToolUseHandler
-	OnPostToolUseFailure  PostToolUseFailureHandler
-	OnUserPromptSubmitted UserPromptSubmittedHandler
-	OnSessionStart        SessionStartHandler
-	OnSessionEnd          SessionEndHandler
-	OnErrorOccurred       ErrorOccurredHandler
-	OnAgentStop           AgentStopHandler
-	OnPreMCPToolCall      PreMCPToolCallHandler
+	OnPreToolUse            PreToolUseHandler
+	OnPostToolUse           PostToolUseHandler
+	OnPostToolUseFailure    PostToolUseFailureHandler
+	OnUserPromptSubmitted   UserPromptSubmittedHandler
+	OnUserPromptTransformed UserPromptTransformedHandler
+	OnSessionStart          SessionStartHandler
+	OnSessionEnd            SessionEndHandler
+	OnErrorOccurred         ErrorOccurredHandler
+	OnAgentStop             AgentStopHandler
+	OnPreMCPToolCall        PreMCPToolCallHandler
 }
 
 // MCPServerConfig is implemented by MCP server configuration types.
@@ -1153,6 +1306,16 @@ type GitHubMCPToolConfig struct {
 	DisableFormDeferral *bool    `json:"disableFormDeferral,omitempty"`
 }
 
+// AskUserVariant selects the model-facing shape of the ask_user tool.
+type AskUserVariant string
+
+const (
+	// AskUserVariantLegacy uses the legacy user-input request implementation.
+	AskUserVariantLegacy AskUserVariant = "legacy"
+	// AskUserVariantElicitation uses the elicitation-based implementation.
+	AskUserVariantElicitation AskUserVariant = "elicitation"
+)
+
 // SessionConfig configures a new session
 type SessionConfig struct {
 	// SessionID is an optional custom session ID
@@ -1163,7 +1326,7 @@ type SessionConfig struct {
 	// Model to use for this session
 	Model string
 	// ReasoningEffort level for models that support it.
-	// Valid values: "low", "medium", "high", "xhigh"
+	// Valid values: "low", "medium", "high", "xhigh", "max"
 	// Only applies to models where capabilities.supports.reasoningEffort is true.
 	ReasoningEffort string
 	// ReasoningSummary mode for models that support configurable reasoning summaries.
@@ -1211,6 +1374,10 @@ type SessionConfig struct {
 	// and discovered skill directories). When false, no skills are loaded regardless
 	// of SkillDirectories or EnableConfigDiscovery settings.
 	EnableSkills *bool
+	// IncludedBuiltinSkills is the allowlist of runtime-bundled skill names.
+	// In ModeEmpty, nil excludes all built-in skills; a non-nil list opts the
+	// named built-ins back in. Skills from other sources remain eligible.
+	IncludedBuiltinSkills []string
 	// Tools exposes caller-implemented tools to the CLI. A Tool with a nil Handler
 	// is declaration-only; the consumer must resolve its calls via pending tool RPCs.
 	Tools []Tool
@@ -1235,13 +1402,24 @@ type SessionConfig struct {
 	// When provided, the SDK can satisfy MCP server OAuth requests with host-provided
 	// token data or cancellation.
 	OnMCPAuthRequest MCPAuthHandler
-	// OnUserInputRequest is a handler for user input requests from the agent (enables ask_user tool)
+	// GitHubTokenProvider acquires session-scoped GitHub tokens on demand. It
+	// cannot be combined with GitHubToken.
+	GitHubTokenProvider GitHubTokenProvider
+	// OnUserInputRequest handles legacy question-and-answer requests from the agent
+	// and enables the legacy ask_user tool.
 	OnUserInputRequest UserInputHandler
+	// AskUserVariant selects the model-facing shape of the ask_user tool.
+	// The zero value preserves legacy behavior. AskUserVariantElicitation also
+	// requires OnElicitationRequest so the host can answer structured forms.
+	AskUserVariant AskUserVariant
 	// Hooks configures hook handlers for session lifecycle events
 	Hooks *SessionHooks
 	// WorkingDirectory is the working directory for the session.
 	// Tool operations will be relative to this directory.
 	WorkingDirectory string
+	// AdditionalDirectories are directories the agent may access beyond WorkingDirectory.
+	// Relative paths are resolved against WorkingDirectory. Re-supply them when resuming.
+	AdditionalDirectories []string
 	// Streaming enables streaming of assistant message and reasoning chunks.
 	// When non-nil and true, assistant.message_delta and assistant.reasoning_delta
 	// events with deltaContent are sent as the response is generated.
@@ -1282,11 +1460,18 @@ type SessionConfig struct {
 	// Experimental: EnableCitations is part of an experimental model capability
 	// surface and may change or be removed in future SDK or CLI releases.
 	EnableCitations *bool
+	// EnableFileChangeTracking opts in to capturing file changes from the first
+	// turn for session rewind and cumulative session diff.
+	EnableFileChangeTracking *bool
 	// SessionLimits applies limits to this session's current accounting window.
 	//
 	// Experimental: SessionLimits is part of an experimental runtime accounting
 	// surface and may change or be removed in future SDK or CLI releases.
 	SessionLimits *rpc.SessionLimitsConfig
+	// EnableExperimentalMode controls whether the session enables experimental
+	// features. When nil, it defaults to false in [ModeEmpty]; otherwise the
+	// runtime decides.
+	EnableExperimentalMode *bool
 	// SkipCustomInstructions, when non-nil, controls whether the runtime loads
 	// custom instruction files. See also [ClientOptions.Mode] = [ModeEmpty].
 	SkipCustomInstructions *bool
@@ -1328,6 +1513,10 @@ type SessionConfig struct {
 	InstructionDirectories []string
 	// DisabledSkills is a list of skill names to disable
 	DisabledSkills []string
+	// DisabledMCPServers is a list of exact MCP server names to disable for this session.
+	// Disabled servers are not started or authenticated on create or cold resume.
+	// A resident resume cannot stop servers that are already running.
+	DisabledMCPServers []string
 	// InfiniteSessions configures infinite sessions for persistent workspaces and automatic compaction.
 	// When enabled (default), sessions automatically manage context limits and persist state.
 	InfiniteSessions *InfiniteSessionConfig
@@ -1440,12 +1629,65 @@ type SessionConfig struct {
 	// intended for trusted out-of-process integrators, and is not intended for
 	// general external use.
 	ExpAssignments *CopilotExpAssignmentResponse
+	// FeatureFlags contains feature-flag values resolved by the host for this session.
+	// Re-supply them when resuming after a runtime restart.
+	FeatureFlags map[string]bool
 	// EnableManagedSettings, when set to true, opts the runtime into
 	// self-fetching enterprise managed settings (bypass-permissions policy) at
 	// session bootstrap using the session's GitHubToken. Requires GitHubToken to
 	// be set; if omitted, the runtime is expected to reject session creation
 	// (fail-closed). Unset behaves exactly as before.
 	EnableManagedSettings *bool
+	// ManagedSettings supplies host-injected enterprise managed settings for
+	// the session. Unlike EnableManagedSettings (which asks the runtime to
+	// self-fetch account/org and device policy), this provides the managed
+	// policy directly. The runtime validates it with the same
+	// managed-permission parser it uses for fetched policy and composes it
+	// restrictively with any self-fetched (server) and device-managed (MDM)
+	// layers. It is startup-only and not persisted: re-supply it on resume,
+	// where it replaces the prior injected layer (omitting it clears the
+	// layer). It may be combined with EnableManagedSettings. Requires a runtime
+	// whose RPC schema includes managedSettings.
+	ManagedSettings *ManagedSettings
+}
+
+// ManagedSettings is host-injected enterprise managed settings for a session.
+// The first supported contract is permissions-only; unknown sibling keys are
+// rejected by the runtime. Serialized on the wire as managedSettings.
+type ManagedSettings struct {
+	// Permissions is the managed permission policy for the session.
+	Permissions *ManagedSettingsPermissions `json:"permissions,omitempty"`
+}
+
+// DisableBypassPermissionsMode is the managed bypass-permissions policy.
+//
+// The runtime may introduce additional fail-closed modes. Values are serialized
+// as strings so callers can use newer modes without waiting for an SDK release.
+type DisableBypassPermissionsMode string
+
+const (
+	// DisableBypassPermissionsModeDisable turns off bypass-permissions mode.
+	DisableBypassPermissionsModeDisable DisableBypassPermissionsMode = "disable"
+	// DisableBypassPermissionsModeAllowAutoOnly permits only automatic bypass.
+	DisableBypassPermissionsModeAllowAutoOnly DisableBypassPermissionsMode = "allow-auto-only"
+)
+
+// ManagedSettingsPermissions is the permissions-only managed policy injected
+// via ManagedSettings. Rule strings use the same vocabulary the runtime
+// accepts for fetched managed policy (e.g. "Read(**)", "Shell(git push *)");
+// malformed rules are rejected by the runtime at session creation.
+type ManagedSettingsPermissions struct {
+	// DisableBypassPermissionsMode restricts bypass-permissions mode for the
+	// session. See the DisableBypassPermissionsMode constants for known values.
+	// Newer values are forwarded unchanged so runtime policies remain fail-closed.
+	DisableBypassPermissionsMode DisableBypassPermissionsMode `json:"disableBypassPermissionsMode,omitempty"`
+	// Deny lists operations that must always be denied. Unioned across layers.
+	Deny []string `json:"deny,omitzero"`
+	// Ask lists operations that must prompt for approval. Unioned across layers.
+	Ask []string `json:"ask,omitzero"`
+	// Allow lists operations permitted without prompting. Every declared allow
+	// list across managed layers must admit an operation for it to be allowed.
+	Allow []string `json:"allow,omitzero"`
 }
 
 // ToolDefer controls whether a tool may be deferred (loaded lazily via tool
@@ -1465,6 +1707,11 @@ type Tool struct {
 	Parameters           map[string]any `json:"parameters,omitzero"`
 	OverridesBuiltInTool bool           `json:"overridesBuiltInTool,omitempty"`
 	SkipPermission       bool           `json:"skipPermission,omitempty"`
+	// IsTerminal reports that a successful call to this tool ends the agent
+	// turn: the runtime halts instead of feeding the result back to the model
+	// for another round. A failed call leaves the loop running so the model can
+	// read the error and retry.
+	IsTerminal bool `json:"isTerminal,omitempty"`
 	// Defer controls whether the tool may be deferred (loaded lazily via tool
 	// search) rather than always pre-loaded. When empty, the runtime decides.
 	Defer ToolDefer `json:"defer,omitempty"`
@@ -1642,6 +1889,9 @@ type ResumeSessionConfig struct {
 	// ClientName identifies the application using the SDK.
 	// Included in the User-Agent header for API requests.
 	ClientName string
+	// GitHubTokenProvider acquires session-scoped GitHub tokens on demand. It
+	// cannot be combined with GitHubToken.
+	GitHubTokenProvider GitHubTokenProvider
 	// Model to use for this session. Can change the model when resuming.
 	Model string
 	// Tools exposes caller-implemented tools to the CLI. A Tool with a nil Handler
@@ -1660,6 +1910,10 @@ type ResumeSessionConfig struct {
 	// be selected or invoked unless a custom agent with the same name is
 	// configured.
 	ExcludedBuiltInAgents []string
+	// IncludedBuiltinSkills is the allowlist of runtime-bundled skill names.
+	// In ModeEmpty, nil excludes all built-in skills; a non-nil list opts the
+	// named built-ins back in. Skills from other sources remain eligible.
+	IncludedBuiltinSkills []string
 	// Provider configures a custom model provider
 	Provider *ProviderConfig
 	// Capi configures provider-scoped CAPI (Copilot API) session options.
@@ -1688,11 +1942,19 @@ type ResumeSessionConfig struct {
 	// Experimental: EnableCitations is part of an experimental model capability
 	// surface and may change or be removed in future SDK or CLI releases.
 	EnableCitations *bool
+	// EnableFileChangeTracking opts in to capturing file changes for session
+	// rewind and cumulative session diff when the resumed session has a valid
+	// baseline. Earlier untracked changes cannot be reconstructed.
+	EnableFileChangeTracking *bool
 	// SessionLimits applies limits to this session's current accounting window.
 	//
 	// Experimental: SessionLimits is part of an experimental runtime accounting
 	// surface and may change or be removed in future SDK or CLI releases.
 	SessionLimits *rpc.SessionLimitsConfig
+	// EnableExperimentalMode controls whether the session enables experimental
+	// features. When nil, it defaults to false in [ModeEmpty]; otherwise the
+	// runtime decides.
+	EnableExperimentalMode *bool
 	// SkipCustomInstructions, when non-nil, controls whether the runtime loads
 	// custom instruction files. See also [ClientOptions.Mode] = [ModeEmpty].
 	SkipCustomInstructions *bool
@@ -1710,7 +1972,7 @@ type ResumeSessionConfig struct {
 	// Only non-nil fields are applied over the runtime-resolved capabilities.
 	ModelCapabilities *rpc.ModelCapabilitiesOverride
 	// ReasoningEffort level for models that support it.
-	// Valid values: "low", "medium", "high", "xhigh"
+	// Valid values: "low", "medium", "high", "xhigh", "max"
 	ReasoningEffort string
 	// ReasoningSummary mode for models that support configurable reasoning summaries.
 	// Use ReasoningSummaryNone to suppress summary output regardless of whether reasoning is enabled.
@@ -1725,13 +1987,21 @@ type ResumeSessionConfig struct {
 	// OnMCPAuthRequest is an optional handler for MCP OAuth requests from MCP servers.
 	// See SessionConfig.OnMCPAuthRequest.
 	OnMCPAuthRequest MCPAuthHandler
-	// OnUserInputRequest is a handler for user input requests from the agent (enables ask_user tool)
+	// OnUserInputRequest handles legacy question-and-answer requests from the agent
+	// and enables the legacy ask_user tool.
 	OnUserInputRequest UserInputHandler
+	// AskUserVariant selects the model-facing shape of the ask_user tool.
+	// The zero value preserves legacy behavior. AskUserVariantElicitation also
+	// requires OnElicitationRequest so the host can answer structured forms.
+	AskUserVariant AskUserVariant
 	// Hooks configures hook handlers for session lifecycle events
 	Hooks *SessionHooks
 	// WorkingDirectory is the working directory for the session.
 	// Tool operations will be relative to this directory.
 	WorkingDirectory string
+	// AdditionalDirectories are directories the agent may access beyond WorkingDirectory.
+	// Relative paths are resolved against WorkingDirectory. Re-supply them when resuming.
+	AdditionalDirectories []string
 	// ConfigDirectory overrides the default configuration directory location.
 	ConfigDirectory string
 	// EnableConfigDiscovery enables runtime discovery of supported configuration.
@@ -1800,6 +2070,10 @@ type ResumeSessionConfig struct {
 	InstructionDirectories []string
 	// DisabledSkills is a list of skill names to disable
 	DisabledSkills []string
+	// DisabledMCPServers is a list of exact MCP server names to disable for this session.
+	// Disabled servers are not started or authenticated on create or cold resume.
+	// A resident resume cannot stop servers that are already running.
+	DisabledMCPServers []string
 	// InfiniteSessions configures infinite sessions for persistent workspaces and automatic compaction.
 	InfiniteSessions *InfiniteSessionConfig
 	// LargeOutput configures handling of large tool outputs. When a tool produces
@@ -1889,10 +2163,18 @@ type ResumeSessionConfig struct {
 	// intended for trusted out-of-process integrators, and is not intended for
 	// general external use.
 	ExpAssignments *CopilotExpAssignmentResponse
+	// FeatureFlags contains host-resolved feature-flag values to apply on resume.
+	// See SessionConfig.FeatureFlags.
+	FeatureFlags map[string]bool
 	// EnableManagedSettings injects the same opt-in flag on resume. See
 	// SessionConfig.EnableManagedSettings. Re-supply on resume so the runtime
 	// re-applies the managed-settings self-fetch after a CLI process restart.
 	EnableManagedSettings *bool
+	// ManagedSettings re-injects host-provided managed settings on resume. See
+	// SessionConfig.ManagedSettings. It must be re-supplied on resume: it
+	// replaces the prior injected layer, and omitting it clears that layer so
+	// warm and cold resume behave identically.
+	ManagedSettings *ManagedSettings
 }
 
 // ProviderTokenArgs carries the context passed to a [BearerTokenProvider] callback
@@ -2004,6 +2286,18 @@ func (p ProviderConfig) MarshalJSON() ([]byte, error) {
 	return json.Marshal(aux)
 }
 
+// AutoTier selects the routing tier for model "auto" with V2 Auto.
+type AutoTier = rpc.AutoTier
+
+const (
+	// AutoTierEfficiency selects the efficiency routing tier.
+	AutoTierEfficiency = rpc.AutoTierEfficiency
+	// AutoTierBalance selects the balance routing tier.
+	AutoTierBalance = rpc.AutoTierBalance
+	// AutoTierIntelligence selects the intelligence routing tier.
+	AutoTierIntelligence = rpc.AutoTierIntelligence
+)
+
 // CapiSessionOptions configures provider-scoped Copilot API (CAPI) session behavior.
 //
 // WebSocket transport is the default for the CAPI Responses API whenever the
@@ -2018,6 +2312,14 @@ type CapiSessionOptions struct {
 	// WebSocket transport. Enabled by default when the model advertises
 	// ws:/responses support; set to Bool(false) to force HTTP Responses transport.
 	EnableWebSocketResponses *bool `json:"enableWebSocketResponses,omitempty"`
+
+	// AutoTier selects the routing tier for model "auto" with V2 Auto.
+	// Requires a runtime that supports Auto tiers; it has no effect outside V2 Auto.
+	// When unset, the runtime uses its default on create and preserves the
+	// persisted or current tier on resume. An explicit tier overrides the
+	// persisted tier on a cold resume; a conflicting tier on a resident
+	// session resume is rejected by the runtime.
+	AutoTier AutoTier `json:"autoTier,omitempty"`
 }
 
 // AzureProviderOptions contains Azure-specific provider configuration
@@ -2212,6 +2514,7 @@ type ModelInfo struct {
 	Capabilities              ModelCapabilities `json:"capabilities"`
 	Policy                    *ModelPolicy      `json:"policy,omitempty"`
 	Billing                   *ModelBilling     `json:"billing,omitempty"`
+	Metadata                  map[string]any    `json:"metadata,omitempty"`
 	SupportedReasoningEfforts []string          `json:"supportedReasoningEfforts,omitempty"`
 	DefaultReasoningEffort    string            `json:"defaultReasoningEffort,omitempty"`
 }
@@ -2298,7 +2601,9 @@ type createSessionRequest struct {
 	Models                             []ProviderModelConfig                  `json:"models,omitempty"`
 	EnableSessionTelemetry             *bool                                  `json:"enableSessionTelemetry,omitempty"`
 	EnableCitations                    *bool                                  `json:"enableCitations,omitempty"`
+	EnableFileChangeTracking           *bool                                  `json:"enableFileChangeTracking,omitempty"`
 	SessionLimits                      *rpc.SessionLimitsConfig               `json:"sessionLimits,omitempty"`
+	IsExperimentalMode                 *bool                                  `json:"isExperimentalMode,omitempty"`
 	SkipCustomInstructions             *bool                                  `json:"skipCustomInstructions,omitempty"`
 	CustomAgentsLocalOnly              *bool                                  `json:"customAgentsLocalOnly,omitempty"`
 	CoauthorEnabled                    *bool                                  `json:"coauthorEnabled,omitempty"`
@@ -2306,10 +2611,12 @@ type createSessionRequest struct {
 	ModelCapabilities                  *rpc.ModelCapabilitiesOverride         `json:"modelCapabilities,omitempty"`
 	RequestPermission                  *bool                                  `json:"requestPermission,omitempty"`
 	RequestUserInput                   *bool                                  `json:"requestUserInput,omitempty"`
+	AskUserVariant                     AskUserVariant                         `json:"askUserVariant,omitempty"`
 	RequestExitPlanMode                *bool                                  `json:"requestExitPlanMode,omitempty"`
 	RequestAutoModeSwitch              *bool                                  `json:"requestAutoModeSwitch,omitempty"`
 	Hooks                              *bool                                  `json:"hooks,omitempty"`
 	WorkingDirectory                   string                                 `json:"workingDirectory,omitempty"`
+	AdditionalDirectories              []string                               `json:"additionalDirectories,omitempty"`
 	Streaming                          *bool                                  `json:"streaming,omitempty"`
 	IncludeSubAgentStreamingEvents     *bool                                  `json:"includeSubAgentStreamingEvents,omitempty"`
 	EnableGitHubTelemetryForwarding    *bool                                  `json:"enableGitHubTelemetryForwarding,omitempty"`
@@ -2333,6 +2640,7 @@ type createSessionRequest struct {
 	PluginDirectories                  []string                               `json:"pluginDirectories,omitempty"`
 	InstructionDirectories             []string                               `json:"instructionDirectories,omitempty"`
 	DisabledSkills                     []string                               `json:"disabledSkills,omitempty"`
+	DisabledMCPServers                 *[]string                              `json:"disabledMcpServers,omitempty"`
 	InfiniteSessions                   *InfiniteSessionConfig                 `json:"infiniteSessions,omitempty"`
 	LargeOutput                        *LargeToolOutputConfig                 `json:"largeOutput,omitempty"`
 	ToolSearch                         *ToolSearchConfig                      `json:"toolSearch,omitempty"`
@@ -2342,6 +2650,7 @@ type createSessionRequest struct {
 	RequestMCPApps                     *bool                                  `json:"requestMcpApps,omitempty"`
 	GitHubMCPToolConfig                *GitHubMCPToolConfig                   `json:"githubMcpToolConfig,omitempty"`
 	GitHubToken                        string                                 `json:"gitHubToken,omitempty"`
+	GitHubTokenProviderRegistrationID  string                                 `json:"gitHubTokenProviderRegistrationId,omitempty"`
 	RemoteSession                      rpc.RemoteSessionMode                  `json:"remoteSession,omitempty"`
 	Cloud                              *CloudSessionOptions                   `json:"cloud,omitempty"`
 	Canvases                           []CanvasDeclaration                    `json:"canvases,omitempty"`
@@ -2351,7 +2660,9 @@ type createSessionRequest struct {
 	ExtensionInfo                      *ExtensionInfo                         `json:"extensionInfo,omitempty"`
 	CanvasProvider                     *CanvasProviderIdentity                `json:"canvasProvider,omitempty"`
 	ExpAssignments                     *CopilotExpAssignmentResponse          `json:"expAssignments,omitempty"`
+	FeatureFlags                       *map[string]bool                       `json:"featureFlags,omitempty"`
 	EnableManagedSettings              *bool                                  `json:"enableManagedSettings,omitempty"`
+	ManagedSettings                    *ManagedSettings                       `json:"managedSettings,omitempty"`
 	Traceparent                        string                                 `json:"traceparent,omitempty"`
 	Tracestate                         string                                 `json:"tracestate,omitempty"`
 }
@@ -2359,7 +2670,7 @@ type createSessionRequest struct {
 // wireCommand is the wire representation of a command (name + description only, no handler).
 type wireCommand struct {
 	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
+	Description string `json:"description"`
 }
 
 // createSessionResponse is the response from session.create
@@ -2389,7 +2700,9 @@ type resumeSessionRequest struct {
 	Models                             []ProviderModelConfig                  `json:"models,omitempty"`
 	EnableSessionTelemetry             *bool                                  `json:"enableSessionTelemetry,omitempty"`
 	EnableCitations                    *bool                                  `json:"enableCitations,omitempty"`
+	EnableFileChangeTracking           *bool                                  `json:"enableFileChangeTracking,omitempty"`
 	SessionLimits                      *rpc.SessionLimitsConfig               `json:"sessionLimits,omitempty"`
+	IsExperimentalMode                 *bool                                  `json:"isExperimentalMode,omitempty"`
 	SkipCustomInstructions             *bool                                  `json:"skipCustomInstructions,omitempty"`
 	CustomAgentsLocalOnly              *bool                                  `json:"customAgentsLocalOnly,omitempty"`
 	CoauthorEnabled                    *bool                                  `json:"coauthorEnabled,omitempty"`
@@ -2397,10 +2710,12 @@ type resumeSessionRequest struct {
 	ModelCapabilities                  *rpc.ModelCapabilitiesOverride         `json:"modelCapabilities,omitempty"`
 	RequestPermission                  *bool                                  `json:"requestPermission,omitempty"`
 	RequestUserInput                   *bool                                  `json:"requestUserInput,omitempty"`
+	AskUserVariant                     AskUserVariant                         `json:"askUserVariant,omitempty"`
 	RequestExitPlanMode                *bool                                  `json:"requestExitPlanMode,omitempty"`
 	RequestAutoModeSwitch              *bool                                  `json:"requestAutoModeSwitch,omitempty"`
 	Hooks                              *bool                                  `json:"hooks,omitempty"`
 	WorkingDirectory                   string                                 `json:"workingDirectory,omitempty"`
+	AdditionalDirectories              []string                               `json:"additionalDirectories,omitempty"`
 	ConfigDir                          string                                 `json:"configDir,omitempty"`
 	EnableConfigDiscovery              *bool                                  `json:"enableConfigDiscovery,omitempty"`
 	SkipEmbeddingRetrieval             *bool                                  `json:"skipEmbeddingRetrieval,omitempty"`
@@ -2426,6 +2741,7 @@ type resumeSessionRequest struct {
 	PluginDirectories                  []string                               `json:"pluginDirectories,omitempty"`
 	InstructionDirectories             []string                               `json:"instructionDirectories,omitempty"`
 	DisabledSkills                     []string                               `json:"disabledSkills,omitempty"`
+	DisabledMCPServers                 *[]string                              `json:"disabledMcpServers,omitempty"`
 	InfiniteSessions                   *InfiniteSessionConfig                 `json:"infiniteSessions,omitempty"`
 	LargeOutput                        *LargeToolOutputConfig                 `json:"largeOutput,omitempty"`
 	ToolSearch                         *ToolSearchConfig                      `json:"toolSearch,omitempty"`
@@ -2435,6 +2751,7 @@ type resumeSessionRequest struct {
 	RequestMCPApps                     *bool                                  `json:"requestMcpApps,omitempty"`
 	GitHubMCPToolConfig                *GitHubMCPToolConfig                   `json:"githubMcpToolConfig,omitempty"`
 	GitHubToken                        string                                 `json:"gitHubToken,omitempty"`
+	GitHubTokenProviderRegistrationID  string                                 `json:"gitHubTokenProviderRegistrationId,omitempty"`
 	RemoteSession                      rpc.RemoteSessionMode                  `json:"remoteSession,omitempty"`
 	Canvases                           []CanvasDeclaration                    `json:"canvases,omitempty"`
 	OpenCanvases                       []rpc.OpenCanvasInstance               `json:"openCanvases,omitempty"`
@@ -2444,7 +2761,9 @@ type resumeSessionRequest struct {
 	ExtensionInfo                      *ExtensionInfo                         `json:"extensionInfo,omitempty"`
 	CanvasProvider                     *CanvasProviderIdentity                `json:"canvasProvider,omitempty"`
 	ExpAssignments                     *CopilotExpAssignmentResponse          `json:"expAssignments,omitempty"`
+	FeatureFlags                       *map[string]bool                       `json:"featureFlags,omitempty"`
 	EnableManagedSettings              *bool                                  `json:"enableManagedSettings,omitempty"`
+	ManagedSettings                    *ManagedSettings                       `json:"managedSettings,omitempty"`
 	Traceparent                        string                                 `json:"traceparent,omitempty"`
 	Tracestate                         string                                 `json:"tracestate,omitempty"`
 }

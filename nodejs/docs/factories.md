@@ -16,11 +16,12 @@ const reviewChanged = defineFactory({
             "Review changed files and verify the findings. " +
             "args: { files: string[] } — the paths to review.",
         phases: [{ title: "Review" }, { title: "Verify" }],
-        limits: {
-            maxConcurrentSubagents: 3,
-            maxTotalSubagents: 10,
-            timeoutSeconds: 90.5,
-            maxAiCredits: 5,
+        argsSchema: {
+            type: "object",
+            required: ["files"],
+            properties: {
+                files: { type: "array", items: { type: "string" } },
+            },
         },
     },
     run: async (ctx) => {
@@ -41,9 +42,19 @@ const reviewChanged = defineFactory({
 const session = await joinSession({ factories: [reviewChanged] });
 ```
 
-Factory metadata contains a stable `name`, a human-readable `description`, declared `phases`, and optional `limits`. Phase entries contain a `title` and optional `detail`.
+Factory metadata contains a stable `name`, a human-readable `description`, declared `phases`, an optional `argsSchema`, and optional `limits`. Phase entries contain a `title` and optional `detail`.
 
-There is no declared schema for `ctx.args`. The `run_factory` tool forwards `args` verbatim and its parameter is untyped, so **the `description` is the only thing telling an agent what arguments to supply** — state the expected shape there whenever a factory reads `ctx.args`, as the example above does. Arguments supplied by an extension calling `session.factory.run(...)` directly are typed through `defineFactory<TArgs>`, but that typing does not reach the model. A factory that reads `ctx.args` should validate it rather than assume a shape.
+## Declaring an argument shape
+
+A factory that reads `ctx.args` should declare `meta.argsSchema`, as the example above does. When the model invokes the factory through the `run_factory` tool, the CLI validates `args` against the declaration **before** the run starts.
+
+Declaring one turns an expensive failure into a cheap one. With a schema, a malformed call is rejected up front — the model gets a correction hint and retries, and no run row, permission prompt, or credit spend happens. Without one, nothing validates: the run starts, takes a user approval, spends credits, and then dies inside the factory body with a confusing error. Agents can read the declared shape with `factories_manage` using `operation: "inspect"`.
+
+Enforcement covers structure — types, required properties, and enum or const values. Finer constraints such as `minLength`, `pattern`, or `additionalProperties` are recorded in the declaration but not enforced. The accepted vocabulary is the `FactoryJsonSchema` subset also used for subagent structured output: `type`, `required`, `enum`, `const`, recursive `properties`/`items`, and `anyOf`/`oneOf`/`allOf`. A `type` is one of `null`, `boolean`, `integer`, `number`, `string`, `array`, or `object`, or a non-empty array of those such as `["object", "null"]`. A declaration outside that subset is rejected at registration.
+
+`argsSchema` is optional and backward compatible. A factory that omits it behaves exactly as before, so **the `description` is then the only thing telling an agent what arguments to supply** — state the expected shape there.
+
+Validation covers the model's `run_factory` path only. An extension calling `session.factory.run(...)` directly is not validated against `argsSchema`; those arguments are typed through `defineFactory<TArgs>` instead, and that typing does not reach the model. So a factory that reads `ctx.args` should still validate it rather than assume a shape — the declared subset does not enforce every constraint, and it does not run at all on the SDK path.
 
 `defineFactory<TArgs, TResult>` accepts a `run(context)` function returning `Promise<TResult>`, where `TResult` is `JsonValue | void`. Objects, arrays, strings, numbers, booleans, and `null` are valid results. Returning `undefined` completes the factory with no result. Other non-JSON values are rejected.
 
@@ -53,7 +64,7 @@ The `run()` context provides:
 
 - `ctx.runId`: Stable ID reused across resumed attempts.
 - `ctx.args`: Invocation arguments, forwarded verbatim. When the caller omits `args`, this is `{}` rather than `undefined`.
-- `ctx.agent(prompt, options?)`: Runs one factory-owned subagent. Options are exactly `label`, `schema`, and `model`. See [Subagent calls](#subagent-calls).
+- `ctx.agent(prompt, options?)`: Runs one factory-owned subagent. Options are exactly `label`, `schema`, `model`, `agent`, `reasoningEffort`, and `contextTier`. See [Subagent calls](#subagent-calls).
 - `ctx.parallel(thunks)`: Runs thunks concurrently and awaits all of them (a barrier). A thunk that throws becomes `null` in the result array, so one failed item does not lose the rest. Cancellation and hard runtime failures (`ResponseError`, `ConnectionError`) are the exception — those propagate and reject the whole call, because they mean the run itself is in trouble rather than one item having failed. Handle them at run level; do not assume every failure arrives as a `null`. Rejects above 4096 items.
 - `ctx.pipeline(items, ...stages)`: Flows each item through every stage without a barrier between stages, so one item can be in a later stage while another is still in an earlier one. Each stage is called as `(previous, item, index)`, where `previous` is the prior stage's result and `item` is the original input. A stage that throws drops that item to `null` and skips its remaining stages, with the same exception for cancellation and hard runtime failures. Rejects above 4096 items.
 - `ctx.phase(title)`: Starts a named progress phase. This sets a single run-global value, so calling it from inside concurrent `parallel`/`pipeline` stages races. Call it at run-level transitions and distinguish concurrent work by `label` instead.
@@ -61,7 +72,7 @@ The `run()` context provides:
 - `ctx.step(key, producer, options?)`: Journals the producer's JSON result under a stable key so a resume replays it without re-running the producer. A journaled (default) producer must return a JSON-serializable value; `undefined` or a non-JSON value is rejected. Pass `{ volatile: true }` to bypass the journal and run the producer every time.
 
   The key is the *sole* identity: neither the producer body nor its inputs contribute to it. A resume replays the cached value for a matching key even if the producer has since changed, so version the key (`"scan-v2"`) whenever its inputs or meaning change. Journaled producers are best-effort at-least-once and may run again across crashes or concurrent same-key callers, so keep side effects idempotent.
-- `ctx.session`: The full session returned by `joinSession`.
+- `ctx.session`: The session returned by `joinSession`. It refuses calls that start or resume a factory run. Call `extensions_manage` with `operation: "guide"` to read more about the session APIs.
 - `ctx.signal`: Cooperative cancellation signal for extension work and subprocesses.
 - `ctx.factory(...)`: Always rejects because nested factories are not supported.
 
@@ -104,7 +115,14 @@ See [factory-patterns.md](./factory-patterns.md) for composable orchestration pa
 
 ## Resource limits
 
-Limits may be declared in `meta.limits` and overridden per invocation. All limits must be positive when present.
+Limits may be declared in `meta.limits` and overridden per invocation. Every limit is optional and must be positive when present; an omitted limit leaves that dimension unbounded, except that an omitted `maxConcurrentSubagents` falls back to `maxTotalSubagents`, so a declared total cap also bounds concurrency.
+
+Set a ceiling only from real knowledge of what the factory costs, or because the user named one. A guessed ceiling does not make a run safer: it stops a healthy run partway with `factory_limit_reached`, after that run has already spent credits. An agent authoring or invoking a factory on the user's behalf has no basis for estimating a number, so it should leave `limits` unset and bound the work with the factory's own counters instead. Omitting limits does not remove oversight of a model-initiated run: `run_factory` requests permission first, and that prompt shows the effective limits. SDK-initiated `run` and `resume` do not request permission, so an SDK caller that wants a ceiling sets it deliberately, from the cost it already knows.
+
+```js
+// Only when the cost profile is known, or the user asked for this ceiling.
+limits: { maxTotalSubagents: 10 },
+```
 
 - `maxConcurrentSubagents`: Positive integer concurrent-subagent cap. Additional subagents wait in a queue. Queueing applies backpressure and does not fail the run.
 - `maxTotalSubagents`: Positive integer cumulative admission cap. An attempted subagent beyond the cap ends the attempt with failure kind `maxTotalSubagents`.
@@ -121,6 +139,8 @@ Run by registered name or handle:
 const run = await session.factory.run("review-changed", {
     args: { files: ["src/a.ts"] },
     limits: { maxAiCredits: 3 },
+    notifyOnComplete: true,
+    logPhaseNames: true,
 });
 
 if (run.status === "completed") {
@@ -135,7 +155,12 @@ The name overload is:
 ```ts
 session.factory.run(
     name: string,
-    options?: { args?: JsonValue; limits?: FactoryLimits },
+    options?: {
+        args?: JsonValue;
+        limits?: FactoryLimits;
+        notifyOnComplete?: boolean;
+        logPhaseNames?: boolean;
+    },
 ): Promise<FactoryRunResult>;
 ```
 
@@ -144,6 +169,8 @@ Resume by run ID without resending the name or arguments:
 ```ts
 const run = await session.factory.resume(runId, {
     limits: { maxAiCredits: 6 },
+    notifyOnComplete: true,
+    logPhaseNames: true,
 });
 ```
 
@@ -152,11 +179,17 @@ The signature is:
 ```ts
 session.factory.resume(
     runId: string,
-    options?: { limits?: FactoryLimits },
+    options?: {
+        limits?: FactoryLimits;
+        notifyOnComplete?: boolean;
+        logPhaseNames?: boolean;
+    },
 ): Promise<FactoryRunResult>;
 ```
 
-Both resolve with the run envelope (`FactoryRunResult`) for **every** outcome — `completed`, `error`, `halted`, and `cancelled` alike. Inspect `status` and read `result` only when the run completed; a limit breach carries a typed `failure`. A declined fresh run is not a pre-execution failure: the run row already exists by the time the prompt is answered, so it resolves with a terminal `cancelled` envelope carrying the run ID. Only failures that occur *before* a run exists reject: an unknown factory name or an already-active session. Pre-execution resume failures, including a declined reapproval, throw `FactoryResumeError`, whose `code` is one of `not_found`, `non_resumable`, `already_active`, `reapproval_declined`, or `no_approval_provider`.
+Set `notifyOnComplete` to `true` for factories that are likely to be invoked by an agent, so the originating session is notified when the factory completes. Set it to `false` for factories intended to be invoked programmatically, where the caller awaits the result directly. Set `logPhaseNames` to emit factory phase names to the session transcript. Both options apply to new and resumed runs.
+
+Both resolve with the run envelope (`FactoryRunResult`) for **every** outcome — `completed`, `error`, `halted`, and `cancelled` alike. Inspect `status` and read `result` only when the run completed; a limit breach carries a typed `failure`. SDK-initiated `run` and `resume` do not request permission, so they have no declined outcome. The model's `run_factory` tool requests permission before the durable row exists; declining it creates no run row. An SDK-initiated run is refused only when the session already has its maximum number of active top-level runs. Pre-execution resume failures throw `FactoryResumeError`, whose `code` is one of `not_found`, `non_resumable`, `already_active`, `factory_already_running`, `factory_limits_invalid`, `factory_session_disposed`, `factory_storage_unavailable`, or `factory_storage_corrupt`.
 
 An agent that no longer has a prior run's ID in context can recover it with `factories_manage` and `operation: "runs"`, which lists the session's factory runs with their IDs and statuses. This matters for resume: a run that reached a limit keeps its journal, so resuming it replays completed work for free, while restarting it from scratch pays for that work twice.
 
@@ -193,7 +226,7 @@ async ({ args, agent, phase }) => {
 };
 ```
 
-Authoring registers the factory but does not run it. Invoke it afterwards with `run_factory`. Use `factories_manage` with `operation: "list"` to see the factories already registered in the session and `operation: "inspect"` to read one factory's description, phases, and limits before running it.
+Authoring registers the factory but does not run it. Invoke it afterwards with `run_factory`. Use `factories_manage` with `operation: "list"` to see the factories already registered in the session and `operation: "inspect"` to read one factory's description, phases, declared argument shape, and limits before running it.
 
 ## Observe a run
 
@@ -201,8 +234,13 @@ The calling session can inspect its own factory runs:
 
 ```ts
 const runs = await session.factory.listRuns();
+const runsPage = await session.factory.listRuns({
+    afterSeq,
+    beforeSeq,
+    limit,
+});
 const detail = await session.factory.getRunDetail(runId);
-const page = await session.factory.getRunProgress(runId, {
+const progressPage = await session.factory.getRunProgress(runId, {
     phaseId,
     afterSeq,
     beforeSeq,
@@ -210,7 +248,8 @@ const page = await session.factory.getRunProgress(runId, {
 });
 ```
 
-- `listRuns()` returns summaries in durable creation order.
+- `listRuns()` returns only the runs array from the newest default page of this session's durable factory runs. This overload preserves the original convenience API.
+- `listRuns({ afterSeq, beforeSeq, limit })` returns the full page. Its `oldestSeq`, `newestSeq`, `hasMoreNewer`, and `omittedOlder` fields let callers continue paging without raw RPC calls.
 - `getRunDetail(runId)` returns phases, prompt-safe agent summaries, and the latest progress page.
 - `getRunProgress(runId, options?)` pages progress forward, backward, by phase, or from the latest tail.
 

@@ -13,6 +13,7 @@
 //! configs hold trait-object handlers, the wire structs hold only the
 //! plain data the runtime needs.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use indexmap::IndexMap;
@@ -24,11 +25,11 @@ use crate::generated::api_types::{
 };
 use crate::generated::session_events::ReasoningSummary;
 use crate::types::{
-    CanvasProviderIdentity, CapiSessionOptions, CloudSessionOptions, CustomAgentConfig,
-    DefaultAgentConfig, ExtensionInfo, GitHubMcpToolConfig, InfiniteSessionConfig,
-    LargeToolOutputConfig, McpServerConfig, MemoryConfiguration, NamedProviderConfig,
-    ProviderConfig, ProviderModelConfig, SessionId, SessionLimitsConfig, SystemMessageConfig, Tool,
-    ToolSearchConfig,
+    AskUserVariant, CanvasProviderIdentity, CapiSessionOptions, CloudSessionOptions,
+    CustomAgentConfig, DefaultAgentConfig, ExtensionInfo, GitHubMcpToolConfig,
+    InfiniteSessionConfig, LargeToolOutputConfig, McpServerConfig, MemoryConfiguration,
+    NamedProviderConfig, ProviderConfig, ProviderModelConfig, SessionId, SessionLimitsConfig,
+    SystemMessageConfig, Tool, ToolSearchConfig,
 };
 
 /// Wire representation of a slash command (name + description only). The
@@ -38,8 +39,9 @@ use crate::types::{
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CommandWireDefinition {
     pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
+    /// Always sent. The runtime requires a string, so a command declared
+    /// without a description is serialized as `""` rather than omitted.
+    pub description: String,
 }
 
 /// The exact JSON shape sent on the `session.create` JSON-RPC request.
@@ -62,6 +64,8 @@ pub(crate) struct SessionCreateWire {
     pub streaming: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_message: Option<SystemMessageConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ask_user_variant: Option<AskUserVariant>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<Tool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -130,6 +134,8 @@ pub(crate) struct SessionCreateWire {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_skills: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_mcp_servers: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_agents: Option<Vec<CustomAgentConfig>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_agents_local_only: Option<bool>,
@@ -152,6 +158,8 @@ pub(crate) struct SessionCreateWire {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enable_citations: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_file_change_tracking: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub session_limits: Option<SessionLimitsConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_capabilities: Option<ModelCapabilitiesOverride>,
@@ -161,8 +169,15 @@ pub(crate) struct SessionCreateWire {
     pub config_dir: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additional_directories: Option<Vec<PathBuf>>,
     #[serde(rename = "gitHubToken", skip_serializing_if = "Option::is_none")]
     pub github_token: Option<String>,
+    #[serde(
+        rename = "gitHubTokenProviderRegistrationId",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub github_token_provider_registration_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_session: Option<RemoteSessionMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -177,9 +192,15 @@ pub(crate) struct SessionCreateWire {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commands: Option<Vec<CommandWireDefinition>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub feature_flags: Option<HashMap<String, bool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub exp_assignments: Option<crate::types::CopilotExpAssignmentResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enable_managed_settings: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_experimental_mode: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed_settings: Option<crate::types::ManagedSettings>,
 }
 
 /// The exact JSON shape sent on the `session.resume` JSON-RPC request.
@@ -201,6 +222,8 @@ pub(crate) struct SessionResumeWire {
     pub streaming: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_message: Option<SystemMessageConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ask_user_variant: Option<AskUserVariant>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<Tool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -270,6 +293,8 @@ pub(crate) struct SessionResumeWire {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_skills: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_mcp_servers: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_agents: Option<Vec<CustomAgentConfig>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_agents_local_only: Option<bool>,
@@ -292,6 +317,8 @@ pub(crate) struct SessionResumeWire {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enable_citations: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_file_change_tracking: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub session_limits: Option<SessionLimitsConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_capabilities: Option<ModelCapabilitiesOverride>,
@@ -301,8 +328,15 @@ pub(crate) struct SessionResumeWire {
     pub config_dir: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additional_directories: Option<Vec<PathBuf>>,
     #[serde(rename = "gitHubToken", skip_serializing_if = "Option::is_none")]
     pub github_token: Option<String>,
+    #[serde(
+        rename = "gitHubTokenProviderRegistrationId",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub github_token_provider_registration_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_session: Option<RemoteSessionMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -320,7 +354,13 @@ pub(crate) struct SessionResumeWire {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub continue_pending_work: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub feature_flags: Option<HashMap<String, bool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub exp_assignments: Option<crate::types::CopilotExpAssignmentResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enable_managed_settings: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_experimental_mode: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed_settings: Option<crate::types::ManagedSettings>,
 }

@@ -7,6 +7,7 @@
  * @module session
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { MessageConnection } from "vscode-jsonrpc/node.js";
 import { ConnectionError, ErrorCodes, ResponseError } from "vscode-jsonrpc/node.js";
 import { createSessionRpc } from "./generated/rpc.js";
@@ -16,14 +17,12 @@ import type {
     CurrentToolMetadata,
     McpOauthPendingRequestResponse,
     FactoryLogLine,
-    FactoryRunRequest,
-    FactoryExecuteResult,
-    FactoryJournalPutRequest,
     FactoryRunResult as WireFactoryRunResult,
 } from "./generated/rpc.js";
 import { type Canvas, CanvasError } from "./canvas.js";
 import type { OpenCanvasInstance } from "./generated/rpc.js";
 import { getTraceContext } from "./telemetry.js";
+import { isAttributedPermissionResult } from "./types.js";
 import type {
     CommandHandler,
     AutoModeSwitchHandler,
@@ -43,6 +42,7 @@ import type {
     McpAuthRequest,
     PermissionHandler,
     PermissionRequest,
+    PermissionRequestResult,
     ContextTier,
     ReasoningEffort,
     ReasoningSummary,
@@ -66,11 +66,14 @@ import type {
     UserInputResponse,
 } from "./types.js";
 import {
+    FACTORY_AGENT_OPTION_KEYS,
     getFactoryDefinition,
     FactoryResumeError,
     isFactoryRunTerminal,
     type FactoryResumeErrorCode,
+    type FactoryListRunsOptions,
     type FactoryRunResult,
+    type FactoryAgentOptions,
     type RunOptions,
     type SessionFactoryApi,
     type FactoryContext,
@@ -84,9 +87,33 @@ function isFactoryResumeErrorCode(value: unknown): value is FactoryResumeErrorCo
         value === "not_found" ||
         value === "non_resumable" ||
         value === "already_active" ||
-        value === "reapproval_declined" ||
-        value === "no_approval_provider"
+        value === "factory_already_running" ||
+        value === "factory_limits_invalid" ||
+        value === "factory_session_disposed" ||
+        value === "factory_storage_unavailable" ||
+        value === "factory_storage_corrupt"
     );
+}
+
+function copyDefinedFactoryAgentOption<TKey extends keyof FactoryAgentOptions>(
+    source: FactoryAgentOptions,
+    target: FactoryAgentOptions,
+    key: TKey
+): void {
+    const value = source[key];
+    if (value !== undefined) {
+        target[key] = value;
+    }
+}
+
+const factoryExecutionStore = new AsyncLocalStorage<{ active: boolean }>();
+
+function throwIfFactoryExecutionIsActive(): void {
+    if (factoryExecutionStore.getStore()?.active) {
+        throw new Error(
+            "factory.run and factory.resume are not allowed while a factory body is running on this call path."
+        );
+    }
 }
 
 /**
@@ -255,7 +282,10 @@ class FactoryProgressBuffer {
         const lines = this.pending.splice(0);
         await this.flushTail;
         if (this.flushFailed) {
-            throw this.flushError;
+            console.warn(
+                "Ignoring a background factory progress flush failure after the factory body settled",
+                this.flushError
+            );
         }
         if (lines.length > 0) {
             try {
@@ -286,24 +316,6 @@ class FactoryProgressBuffer {
             this.flushTimer = undefined;
         }
     }
-}
-
-/**
- * Reconcile the generated envelope with the public one.
- *
- * The two are identical at runtime. They differ only in how `result` is typed:
- * the runtime returns any JSON value, but the schema models the field as an
- * opaque node, which the generator renders as an object. {@link FactoryRunResult}
- * corrects that for the factory surface without changing `x-opaque-json`
- * handling for any other consumer, so the boundary needs a cast rather than a
- * conversion.
- *
- * Delete this along with the {@link FactoryRunResult} override once the schema
- * distinguishes opaque JSON values from opaque in-process values —
- * github/copilot-agent-runtime#14122.
- */
-function toPublicFactoryRunResult(envelope: WireFactoryRunResult): FactoryRunResult {
-    return envelope as FactoryRunResult;
 }
 
 async function awaitFactoryOperation<TResult>(
@@ -427,6 +439,7 @@ export class CopilotSession {
     private _capabilities: SessionCapabilities = {};
     private openCanvasInstances: OpenCanvasInstance[] = [];
     private disconnected = false;
+    private onDisconnected?: () => void;
 
     /** @internal Client session API handlers, populated by CopilotClient during create/resume. */
     clientSessionApis: ClientSessionApiHandlers = {};
@@ -442,6 +455,7 @@ export class CopilotSession {
             nameOrHandle: string | FactoryHandle,
             options?: RunOptions
         ): Promise<unknown> => {
+            throwIfFactoryExecutionIsActive();
             const name =
                 typeof nameOrHandle === "string"
                     ? nameOrHandle
@@ -449,26 +463,31 @@ export class CopilotSession {
             if (options?.resumeFromRunId !== undefined) {
                 return this.factory.resume(options.resumeFromRunId, {
                     limits: options.limits,
+                    notifyOnComplete: options.notifyOnComplete,
+                    logPhaseNames: options.logPhaseNames,
                 });
             }
             const envelope = await this.rpc.factory.run({
                 name,
-                args: (options?.args === undefined
-                    ? {}
-                    : options.args) as FactoryRunRequest["args"],
+                args: options?.args === undefined ? {} : options.args,
                 options: {
                     limits: options?.limits,
+                    notifyOnComplete: options?.notifyOnComplete,
+                    logPhaseNames: options?.logPhaseNames,
                 },
             });
 
-            return toPublicFactoryRunResult(envelope);
+            return this.settleFactoryRun(envelope);
         }) as SessionFactoryApi["run"],
         resume: (async (runId: string, options?: Parameters<SessionFactoryApi["resume"]>[1]) => {
+            throwIfFactoryExecutionIsActive();
             let response;
             try {
                 response = await this.rpc.factory.resume({
                     runId,
                     limits: options?.limits,
+                    notifyOnComplete: options?.notifyOnComplete,
+                    logPhaseNames: options?.logPhaseNames,
                 });
             } catch (error) {
                 if (
@@ -483,16 +502,33 @@ export class CopilotSession {
                 }
                 throw error;
             }
-            return toPublicFactoryRunResult(response.run);
+            return this.settleFactoryRun(response.run);
         }) as SessionFactoryApi["resume"],
-        getRun: async (runId) => toPublicFactoryRunResult(await this.rpc.factory.getRun({ runId })),
+        getRun: async (runId) => this.rpc.factory.getRun({ runId }),
         waitForRun: (runId, options) => this.waitForFactoryRun(runId, options?.signal),
-        listRuns: async () => (await this.rpc.factory.listRuns()).runs,
+        listRuns: (async (options?: FactoryListRunsOptions) => {
+            const page = await this.rpc.factory.listRuns(options ?? {});
+            return options === undefined ? page.runs : page;
+        }) as SessionFactoryApi["listRuns"],
         getRunDetail: (runId) => this.rpc.factory.getRunDetail({ runId }),
         getRunProgress: (runId, options = {}) =>
             this.rpc.factory.getRunProgress({ runId, ...options }),
-        cancel: async (runId) => toPublicFactoryRunResult(await this.rpc.factory.cancel({ runId })),
+        cancel: async (runId) => this.rpc.factory.cancel({ runId }),
     };
+
+    /**
+     * Resolve a start/resume envelope into the terminal envelope callers expect.
+     *
+     * The CLI may answer `session.factory.run` and `session.factory.resume`
+     * before the run settles, so a non-terminal envelope is followed by a wait
+     * on the run's terminal state.
+     */
+    private settleFactoryRun(envelope: WireFactoryRunResult): Promise<FactoryRunResult> {
+        if (isFactoryRunTerminal(envelope.status)) {
+            return Promise.resolve(envelope);
+        }
+        return this.waitForFactoryRun(envelope.runId);
+    }
 
     /**
      * Resolve when a factory run reaches a terminal status.
@@ -548,7 +584,7 @@ export class CopilotSession {
                         rereadRequested = false;
                         const envelope = await this.rpc.factory.getRun({ runId });
                         if (isFactoryRunTerminal(envelope.status)) {
-                            finish(() => resolve(toPublicFactoryRunResult(envelope)));
+                            finish(() => resolve(envelope));
                             return;
                         }
                     } while (rereadRequested && !settled);
@@ -592,11 +628,16 @@ export class CopilotSession {
         private connection: MessageConnection,
         private _workspacePath?: string,
         traceContextProvider?: TraceContextProvider,
-        options?: { mcpAuthHandler?: McpAuthHandler; managedSettingsEnabled?: boolean }
+        options?: {
+            mcpAuthHandler?: McpAuthHandler;
+            managedSettingsEnabled?: boolean;
+            onDisconnected?: () => void;
+        }
     ) {
         this.traceContextProvider = traceContextProvider;
         this.mcpAuthHandler = options?.mcpAuthHandler;
         this.managedSettingsEnabled = options?.managedSettingsEnabled === true;
+        this.onDisconnected = options?.onDisconnected;
     }
 
     /**
@@ -720,11 +761,10 @@ export class CopilotSession {
             typeof optionsOrPrompt === "string" ? { prompt: optionsOrPrompt } : optionsOrPrompt;
         const effectiveTimeout = timeout ?? 60_000;
 
-        let resolveIdle: () => void;
-        let rejectWithError: (error: Error) => void;
-        const idlePromise = new Promise<void>((resolve, reject) => {
-            resolveIdle = resolve;
-            rejectWithError = reject;
+        type SessionOutcome = { kind: "idle" } | { kind: "error"; error: Error };
+        let resolveOutcome: (outcome: SessionOutcome) => void;
+        const outcomePromise = new Promise<SessionOutcome>((resolve) => {
+            resolveOutcome = resolve;
         });
 
         let lastAssistantMessage: AssistantMessageEvent | undefined;
@@ -734,12 +774,12 @@ export class CopilotSession {
         const unsubscribe = this.on((event) => {
             if (event.type === "assistant.message") {
                 lastAssistantMessage = event;
-            } else if (event.type === "session.idle") {
-                resolveIdle();
+            } else if (event.type === "session.idle" && event.data.mode !== "autopilot") {
+                resolveOutcome({ kind: "idle" });
             } else if (event.type === "session.error") {
                 const error = new Error(event.data.message);
                 error.stack = event.data.stack;
-                rejectWithError(error);
+                resolveOutcome({ kind: "error", error });
             }
         });
 
@@ -758,7 +798,10 @@ export class CopilotSession {
                     effectiveTimeout
                 );
             });
-            await Promise.race([idlePromise, timeoutPromise]);
+            const outcome = await Promise.race([outcomePromise, timeoutPromise]);
+            if (outcome.kind === "error") {
+                throw outcome.error;
+            }
 
             return lastAssistantMessage;
         } finally {
@@ -771,7 +814,11 @@ export class CopilotSession {
 
     /** @internal */
     _markDisconnected(): void {
+        if (this.disconnected) {
+            return;
+        }
         this.disconnected = true;
+        this._runOnDisconnected();
         this.eventHandlers.clear();
         this.typedEventHandlers.clear();
         this.toolHandlers.clear();
@@ -790,6 +837,17 @@ export class CopilotSession {
         }
         this.factoryAbortControllers.clear();
         this.transformCallbacks?.clear();
+    }
+
+    /** @internal */
+    _runOnDisconnected(): void {
+        this.onDisconnected?.();
+        this.onDisconnected = undefined;
+    }
+
+    /** @internal */
+    _setOnDisconnected(callback: () => void): void {
+        this.onDisconnected = callback;
     }
 
     /**
@@ -1108,17 +1166,26 @@ export class CopilotSession {
         permissionRequest: PermissionRequest
     ): Promise<void> {
         try {
-            const result = await this.permissionHandler!(permissionRequest, {
+            const handlerResult = await this.permissionHandler!(permissionRequest, {
                 sessionId: this.sessionId,
                 managedSettingsEnabled: this.managedSettingsEnabled,
             });
+            const isAttributed = isAttributedPermissionResult(handlerResult);
+            const result: PermissionRequestResult = isAttributed
+                ? handlerResult.result
+                : handlerResult;
+            const decisionContext = isAttributed ? handlerResult.decisionContext : undefined;
             if (result.kind === "no-result") {
                 return;
             }
             if (this.disconnected) {
                 return;
             }
-            await this.rpc.permissions.handlePendingPermissionRequest({ requestId, result });
+            await this.rpc.permissions.handlePendingPermissionRequest(
+                decisionContext === undefined
+                    ? { requestId, result }
+                    : { requestId, result, decisionContext }
+            );
         } catch (error) {
             if (this.disconnected) {
                 return;
@@ -1363,7 +1430,7 @@ export class CopilotSession {
                 try {
                     const context: FactoryContext = {
                         runId: params.runId,
-                        args: params.args as JsonValue,
+                        args: params.args,
                         session: self,
                         signal: controller.signal,
                         phase: (title: string) => {
@@ -1376,17 +1443,17 @@ export class CopilotSession {
                         },
                         agent: async (prompt, options = {}) => {
                             await progress.flush();
+                            const opts: FactoryAgentOptions = {};
+                            for (const key of FACTORY_AGENT_OPTION_KEYS) {
+                                copyDefinedFactoryAgentOption(options, opts, key);
+                            }
                             const response = await awaitFactoryOperation(
                                 () =>
                                     self.rpc.factory.agent({
                                         factoryRunId: params.runId,
                                         executionToken: params.executionToken,
                                         prompt,
-                                        opts: {
-                                            label: options.label,
-                                            schema: options.schema,
-                                            model: options.model,
-                                        },
+                                        opts,
                                     }),
                                 controller.signal
                             );
@@ -1436,8 +1503,7 @@ export class CopilotSession {
                                         runId: params.runId,
                                         executionToken: params.executionToken,
                                         key,
-                                        resultJson:
-                                            result as FactoryJournalPutRequest["resultJson"],
+                                        resultJson: result,
                                     }),
                                 controller.signal
                             );
@@ -1449,12 +1515,19 @@ export class CopilotSession {
                             throw new Error("nested factories are not supported");
                         },
                     };
-                    const result = await definition.run(context);
+                    const execution = { active: true };
+                    const result = await factoryExecutionStore.run(execution, async () => {
+                        try {
+                            return await definition.run(context);
+                        } finally {
+                            execution.active = false;
+                        }
+                    });
                     if (result === undefined) {
                         return {};
                     }
                     assertFactoryResult(result);
-                    return { result } as FactoryExecuteResult;
+                    return { result };
                 } finally {
                     try {
                         await progress.close();
@@ -1579,7 +1652,13 @@ export class CopilotSession {
         }
         try {
             const result = await this.elicitationHandler(context);
-            await this.rpc.ui.handlePendingElicitation({ requestId, result });
+            await this.rpc.ui.handlePendingElicitation({
+                requestId,
+                result: {
+                    action: result.action,
+                    ...(result.content ? { content: result.content } : {}),
+                },
+            });
         } catch {
             // Handler failed — attempt to cancel so the request doesn't hang
             try {
@@ -1865,6 +1944,7 @@ export class CopilotSession {
             postToolUse: this.hooks.onPostToolUse as GenericHandler | undefined,
             postToolUseFailure: this.hooks.onPostToolUseFailure as GenericHandler | undefined,
             userPromptSubmitted: this.hooks.onUserPromptSubmitted as GenericHandler | undefined,
+            userPromptTransformed: this.hooks.onUserPromptTransformed as GenericHandler | undefined,
             sessionStart: this.hooks.onSessionStart as GenericHandler | undefined,
             sessionEnd: this.hooks.onSessionEnd as GenericHandler | undefined,
             errorOccurred: this.hooks.onErrorOccurred as GenericHandler | undefined,

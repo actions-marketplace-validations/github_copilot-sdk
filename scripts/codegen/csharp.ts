@@ -40,6 +40,7 @@ import {
     isSchemaExperimental,
     isSchemaInternal,
     isOpaqueJson,
+    isOpaqueInProcess,
     isObjectSchema,
     isVoidSchema,
     getNullableInner,
@@ -69,6 +70,51 @@ const TYPE_RENAMES: Record<string, string> = {
 const POLYMORPHIC_BASE_PROPERTIES: Record<string, readonly string[]> = {
     PermissionRequest: ["managedApprovalRequired"],
 };
+
+/**
+ * Public type names declared by hand-written C# sources under `dotnet/src`
+ * (excluding `dotnet/src/Generated`). Generated session-event types share the
+ * `GitHub.Copilot` namespace with those sources, so a schema definition whose
+ * name collides with a hand-written declaration must reuse it — emitting a
+ * second class of the same name fails the build (CS0260/CS0102).
+ *
+ * Populated by {@link collectHandWrittenCSharpTypeNames} before generation.
+ */
+let handWrittenCSharpTypeNames = new Set<string>();
+
+/**
+ * Scan hand-written `.cs` files under `dotnet/src` for top-level public type
+ * declarations. The `Generated` directory is skipped so this scanner never
+ * reads (or depends on the output of) its own emit.
+ */
+async function collectHandWrittenCSharpTypeNames(): Promise<Set<string>> {
+    const names = new Set<string>();
+    const srcDir = path.join(REPO_ROOT, "dotnet", "src");
+    const declaration = /^\s*(?:public|internal)\s+(?:(?:abstract|sealed|static|partial|readonly|ref)\s+)*(?:class|record|struct|interface|enum)\s+([A-Za-z_]\w*)/gm;
+
+    const walk = async (dir: string): Promise<void> => {
+        let entries;
+        try {
+            entries = await fs.readdir(dir, { withFileTypes: true });
+        } catch {
+            return;
+        }
+        for (const entry of entries) {
+            const entryPath = path.join(dir, entry.name);
+            if (entry.isDirectory()) {
+                if (entry.name === "Generated" || entry.name === "bin" || entry.name === "obj") continue;
+                await walk(entryPath);
+                continue;
+            }
+            if (!entry.name.endsWith(".cs")) continue;
+            const content = await fs.readFile(entryPath, "utf-8");
+            for (const match of content.matchAll(declaration)) names.add(match[1]);
+        }
+    };
+
+    await walk(srcDir);
+    return names;
+}
 
 /** Apply rename to a generated class name, checking both exact match and prefix replacement for derived types. */
 function applyTypeRename(className: string): string {
@@ -308,6 +354,41 @@ function failUnmappable(context: string, schema: JSONSchema7): never {
             `mark it \`.asOpaqueJson()\` so the schema emits \`x-opaque-json: true\` and the codegen maps it to JsonElement. ` +
             `Offending schema (truncated): ${summary}`,
     );
+}
+
+function omitUnrepresentableInternalProperties(value: unknown): void {
+    if (!value || typeof value !== "object") return;
+    if (Array.isArray(value)) {
+        value.forEach(omitUnrepresentableInternalProperties);
+        return;
+    }
+
+    const node = value as Record<string, unknown>;
+    const properties = node.properties;
+    if (properties && typeof properties === "object" && !Array.isArray(properties)) {
+        for (const [name, property] of Object.entries(properties)) {
+            if (!property || typeof property !== "object" || Array.isArray(property)) continue;
+            const schema = property as JSONSchema7;
+            const hasType =
+                schema.type !== undefined ||
+                schema.$ref !== undefined ||
+                schema.anyOf !== undefined ||
+                schema.oneOf !== undefined ||
+                schema.allOf !== undefined ||
+                schema.enum !== undefined ||
+                schema.const !== undefined ||
+                isOpaqueJson(schema);
+            if (isSchemaInternal(schema) && (!hasType || isOpaqueInProcess(schema))) {
+                delete (properties as Record<string, unknown>)[name];
+            } else {
+                omitUnrepresentableInternalProperties(property);
+            }
+        }
+    }
+
+    for (const [name, child] of Object.entries(node)) {
+        if (name !== "properties") omitUnrepresentableInternalProperties(child);
+    }
 }
 
 function requiresArgumentNullCheck(typeName: string, isRequired: boolean): boolean {
@@ -1306,9 +1387,6 @@ function resolveSessionPropertyType(
 
 function generateDataClass(variant: EventVariant, knownTypes: Map<string, string>, nestedClasses: Map<string, string>, enumOutput: string[]): string {
     const dataVisibility = isSchemaInternal(variant.dataSchema) ? "internal" : "public";
-    if (!variant.dataSchema?.properties) return `${dataVisibility} sealed partial class ${variant.dataClassName} { }`;
-
-    const required = new Set(variant.dataSchema.required || []);
     const lines: string[] = [];
     if (variant.dataDescription) {
         lines.push(...xmlDocComment(variant.dataDescription, ""));
@@ -1321,6 +1399,12 @@ function generateDataClass(variant: EventVariant, knownTypes: Map<string, string
     if (isSchemaDeprecated(variant.dataSchema)) {
         pushObsoleteAttributes(lines);
     }
+    if (!variant.dataSchema?.properties) {
+        lines.push(`${dataVisibility} sealed partial class ${variant.dataClassName} { }`);
+        return lines.join("\n");
+    }
+
+    const required = new Set(variant.dataSchema.required || []);
     lines.push(`${dataVisibility} sealed partial class ${variant.dataClassName}`, `{`);
 
     for (const [propName, propSchema] of Object.entries(variant.dataSchema.properties).sort(([a], [b]) => a.localeCompare(b))) {
@@ -1456,8 +1540,13 @@ namespace GitHub.Copilot;
         lines.push(generateDataClass(variant, knownTypes, nestedClasses, enumOutput), "");
     }
 
-    // Nested classes
-    for (const [, code] of nestedClasses) lines.push(code, "");
+    // Nested classes. A name already declared by a hand-written source is skipped:
+    // that declaration is the one the namespace keeps, and the generated property
+    // simply binds to it.
+    for (const [name, code] of nestedClasses) {
+        if (handWrittenCSharpTypeNames.has(name)) continue;
+        lines.push(code, "");
+    }
 
     // Enums
     for (const code of enumOutput) lines.push(code);
@@ -1477,6 +1566,7 @@ export async function generateSessionEvents(schemaPath?: string): Promise<void> 
     const resolvedPath = schemaPath ?? (await getSessionEventsSchemaPath());
     const schema = cloneSchemaForCodegen((await loadSchemaJson(resolvedPath)) as JSONSchema7);
     const processed = propagateInternalVisibility(postProcessSchema(schema));
+    handWrittenCSharpTypeNames = await collectHandWrittenCSharpTypeNames();
     const code = generateSessionEventsCode(processed);
     const outPath = await writeGeneratedFile("dotnet/src/Generated/SessionEvents.cs", code);
     console.log(`  ✓ ${outPath}`);
@@ -2517,6 +2607,8 @@ function generateRpcCode(
     externalJsonSerializableRefs: Map<string, Set<string>> = new Map(),
     externalValueTypes: Set<string> = new Set()
 ): string {
+    schema = cloneSchemaForCodegen(schema);
+    omitUnrepresentableInternalProperties(schema);
     emittedRpcClassSchemas.clear();
     emittedRpcEnumResultTypes.clear();
     experimentalRpcTypes.clear();
@@ -2629,15 +2721,25 @@ namespace GitHub.Copilot.Rpc;
 export async function generateRpc(schemaPath?: string, sessionEventsSchema?: JSONSchema7): Promise<void> {
     console.log("C#: generating RPC types...");
     const resolvedPath = schemaPath ?? (await getApiSchemaPath());
+    handWrittenCSharpTypeNames = await collectHandWrittenCSharpTypeNames();
     let schema = fixNullableRequiredRefsInApiSchema(cloneSchemaForCodegen((await loadSchemaJson(resolvedPath)) as ApiSchema));
+    let sessionEventsCode: string | undefined;
     if (sessionEventsSchema) {
+        sessionEventsCode = generateSessionEventsCode(sessionEventsSchema);
         const sharedDefinitions = findSharedSchemaDefinitions(
             schema as unknown as Record<string, unknown>,
             sessionEventsSchema as unknown as Record<string, unknown>
         );
         const reachableDefinitions = collectReachableDefinitionNames(sessionEventsSchema as unknown as Record<string, unknown>);
         for (const name of [...sharedDefinitions]) {
-            if (!reachableDefinitions.has(name)) {
+            const typeName = typeToClassName(name);
+            const declarationPattern = new RegExp(
+                `\\bpublic\\s+(?:(?:sealed|abstract|partial|readonly)\\s+)*(?:class|struct|enum)\\s+${typeName}\\b`
+            );
+            if (
+                !reachableDefinitions.has(name) ||
+                (!declarationPattern.test(sessionEventsCode) && !handWrittenCSharpTypeNames.has(typeName))
+            ) {
                 sharedDefinitions.delete(name);
             }
         }
@@ -2645,8 +2747,7 @@ export async function generateRpc(schemaPath?: string, sessionEventsSchema?: JSO
     }
     const externalJsonSerializableRefs = new Map<string, Set<string>>();
     const externalValueTypes = new Set<string>();
-    if (sessionEventsSchema) {
-        const sessionEventsCode = generateSessionEventsCode(sessionEventsSchema);
+    if (sessionEventsSchema && sessionEventsCode) {
         const externalRefs = collectExternalSchemaRefNames(schema);
         const sessionEventRefs = externalRefs.get("session-events.schema.json");
         if (sessionEventRefs && sessionEventRefs.size > 0) {
@@ -2658,7 +2759,9 @@ export async function generateRpc(schemaPath?: string, sessionEventsSchema?: JSO
             for (const name of reachableDefinitions) {
                 const typeName = typeToClassName(name);
                 const declarationPattern = new RegExp(`\\bpublic\\s+(?:(?:sealed|abstract|partial|readonly)\\s+)*(?:class|struct)\\s+${typeName}\\b`);
-                if (declarationPattern.test(sessionEventsCode)) {
+                // A hand-written declaration also lives in `GitHub.Copilot`, so the
+                // reference resolves even though the generated file skipped it.
+                if (declarationPattern.test(sessionEventsCode) || handWrittenCSharpTypeNames.has(typeName)) {
                     emittedDefinitions.add(name);
                 }
                 const valueTypeDeclarationPattern = new RegExp(`\\bpublic\\s+(?:(?:readonly)\\s+)?struct\\s+${typeName}\\b`);

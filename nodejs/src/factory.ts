@@ -4,40 +4,19 @@
 
 import type {
     FactoryGetRunProgressRequest,
+    FactoryListRunsRequest,
+    FactoryListRunsResult,
     FactoryProgressPage,
     FactoryRunDetail,
-    FactoryRunResult as WireFactoryRunResult,
+    FactoryRunResult,
     FactoryRunStatus,
     FactoryRunSummary,
 } from "./generated/rpc.js";
+import type { ContextTier } from "./generated/session-events.js";
 import type { CopilotSession } from "./session.js";
 import type { FactoryLimits, FactoryMeta } from "./types.js";
 
-/**
- * The envelope describing a factory run: its identity, status, and — once it
- * has completed — its result. `getRun` returns this for an in-flight run too,
- * so `status` may be `pending` or `running` and the outcome fields absent.
- *
- * `result` is re-typed here rather than taken from the generated wire type. The
- * runtime returns any JSON value — including `null`, a string, a number, or an
- * array — but the schema models the field as an opaque node, which the
- * generator renders as an object. Narrowing the correction to this surface
- * keeps the `x-opaque-json` handling unchanged for every other consumer.
- *
- * This override is temporary. Once the schema distinguishes an opaque JSON
- * value from an opaque in-process value and that ships in a CLI release,
- * regenerating produces the right type directly, and this declaration, the
- * `toPublicFactoryRunResult` boundary helper, and the casts around it should
- * all be deleted. Tracked by github/copilot-agent-runtime#14122.
- *
- * @experimental Part of the experimental Agent Factories surface and may
- * change or be removed in future SDK or CLI releases.
- */
-export type FactoryRunResult = Omit<WireFactoryRunResult, "result"> & {
-    /** Completed factory result. */
-    result?: JsonValue;
-};
-
+export type { FactoryRunResult };
 export type {
     FactoryAgentSummary,
     FactoryPhaseStatus,
@@ -48,6 +27,22 @@ export type {
     FactoryRunStatus,
     FactoryRunSummary,
 } from "./generated/rpc.js";
+
+/**
+ * Options for paging durable factory runs.
+ *
+ * @experimental Part of the experimental Agent Factories surface and may
+ * change or be removed in future SDK or CLI releases.
+ */
+export type FactoryListRunsOptions = FactoryListRunsRequest;
+
+/**
+ * A page of durable factory runs and its paging metadata.
+ *
+ * @experimental Part of the experimental Agent Factories surface and may
+ * change or be removed in future SDK or CLI releases.
+ */
+export type FactoryRunsPage = FactoryListRunsResult;
 
 /**
  * Run statuses a factory run can no longer move away from.
@@ -85,12 +80,16 @@ export type JsonValue =
     | { [key: string]: JsonValue };
 
 /**
- * Conservative JSON shape language accepted for structured factory agent output.
+ * Conservative JSON shape language accepted by the Agent Factories surface, for
+ * both structured factory agent output and a factory's declared `argsSchema`.
  *
- * This is a best-effort structural guard used to decide whether a subagent's
- * structured output should be accepted or retried — **not** a full JSON Schema
+ * This is a best-effort structural guard — used to decide whether a subagent's
+ * structured output should be accepted or retried, and whether a caller's
+ * factory `args` match the declared shape — **not** a full JSON Schema
  * validator. Only these keywords are honored: `type`, `required`, `enum`,
- * `const`, recursive `properties`/`items`, and `anyOf`/`oneOf`/`allOf`.
+ * `const`, recursive `properties`/`items`, and `anyOf`/`oneOf`/`allOf`. A `type`
+ * is one of `null`, `boolean`, `integer`, `number`, `string`, `array`, or
+ * `object`, or a non-empty array of those (for example `["object", "null"]`).
  *
  * Everything else is **ignored, not enforced**. In particular, string
  * constraints (`pattern`, `minLength`, `maxLength`, `format`), numeric ranges
@@ -115,7 +114,19 @@ export interface FactoryAgentOptions {
     label?: string;
     schema?: FactoryJsonSchema;
     model?: string;
+    reasoningEffort?: string;
+    contextTier?: ContextTier;
+    agent?: string;
 }
+
+export const FACTORY_AGENT_OPTION_KEYS = [
+    "label",
+    "schema",
+    "model",
+    "reasoningEffort",
+    "contextTier",
+    "agent",
+] as const;
 
 /**
  * Options for a durable factory step.
@@ -185,7 +196,10 @@ export interface FactoryContext<TArgs extends JsonValue = JsonValue> {
     factory(name: string, args?: JsonValue): Promise<JsonValue | void>;
     /** Caller-supplied input, forwarded verbatim. */
     args: TArgs;
-    /** The same full session instance returned by `joinSession`. */
+    /**
+     * The session instance returned by `joinSession`. It refuses calls that
+     * start or resume a factory run.
+     */
     session: CopilotSession;
     /** Cooperative cancellation signal for the current factory run. */
     signal: AbortSignal;
@@ -246,6 +260,10 @@ export interface RunOptions<TArgs extends JsonValue = JsonValue> {
     args?: TArgs;
     /** Optional per-invocation resource ceiling overrides. */
     limits?: FactoryLimits;
+    /** Whether to notify the originating session when the factory completes. */
+    notifyOnComplete?: boolean;
+    /** Whether to emit factory phase names to the session transcript. */
+    logPhaseNames?: boolean;
     /**
      * Prior run whose persisted identity, arguments, journal, and accounting should be resumed.
      *
@@ -263,6 +281,10 @@ export interface RunOptions<TArgs extends JsonValue = JsonValue> {
 export interface ResumeOptions {
     /** Optional per-invocation resource ceiling overrides. */
     limits?: FactoryLimits;
+    /** Whether to notify the originating session when the factory completes. */
+    notifyOnComplete?: boolean;
+    /** Whether to emit factory phase names to the session transcript. */
+    logPhaseNames?: boolean;
 }
 
 /**
@@ -275,8 +297,11 @@ export type FactoryResumeErrorCode =
     | "not_found"
     | "non_resumable"
     | "already_active"
-    | "reapproval_declined"
-    | "no_approval_provider";
+    | "factory_already_running"
+    | "factory_limits_invalid"
+    | "factory_session_disposed"
+    | "factory_storage_unavailable"
+    | "factory_storage_corrupt";
 
 /**
  * Friendly factory API exposed on a session.
@@ -290,9 +315,12 @@ export interface SessionFactoryApi {
      *
      * The envelope is returned for every outcome, including `error`, `halted`,
      * and `cancelled` — inspect `status` and read `result` only when the run
-     * completed. A declined fresh run resolves with a terminal `cancelled`
-     * envelope. Failures that occur before a run exists (such as an unknown
-     * factory or an already-active session) still reject.
+     * completed. SDK-initiated runs do not request permission, so they have no
+     * declined outcome. The model's `run_factory` tool requests permission
+     * before a durable row exists; declining it creates no run row. Failures
+     * that occur before a run exists (such as an unknown factory or attempting
+     * to start a run while the session is at its active top-level run limit)
+     * still reject.
      */
     run(name: string, options?: RunOptions): Promise<FactoryRunResult>;
     run<TArgs extends JsonValue>(
@@ -302,9 +330,9 @@ export interface SessionFactoryApi {
     /**
      * Resume a run from its persisted factory name, arguments, journal, and accounting.
      *
-     * Resolves with the run envelope like {@link SessionFactoryApi.run}. A
-     * pre-execution failure, including declined reapproval, rejects with
-     * {@link FactoryResumeError}.
+     * Resolves with the run envelope like {@link SessionFactoryApi.run}.
+     * SDK-initiated resumes do not request permission. A pre-execution failure
+     * with a documented resume code rejects with {@link FactoryResumeError}.
      */
     resume(runId: string, options?: ResumeOptions): Promise<FactoryRunResult>;
     /** Read the latest durable envelope for a factory run. */
@@ -324,8 +352,22 @@ export interface SessionFactoryApi {
      * {@link SessionFactoryApi.cancel} to actually stop it.
      */
     waitForRun(runId: string, options?: { signal?: AbortSignal }): Promise<FactoryRunResult>;
-    /** List this session's durable factory runs in creation order. */
+    /**
+     * List the newest default page of this session's durable factory runs.
+     *
+     * This backwards-compatible overload returns only the runs array. Pass
+     * paging options to receive the full page, including its cursors and
+     * truncation metadata.
+     */
     listRuns(): Promise<FactoryRunSummary[]>;
+    /**
+     * Page this session's durable factory runs.
+     *
+     * `afterSeq` and `beforeSeq` are exclusive cursors. The result includes
+     * `oldestSeq`, `newestSeq`, `hasMoreNewer`, and `omittedOlder` so callers
+     * can continue paging without using the raw RPC client.
+     */
+    listRuns(options: FactoryListRunsOptions): Promise<FactoryRunsPage>;
     /** Read durable phases, direct agents, and the latest progress tail for a run. */
     getRunDetail(runId: string): Promise<FactoryRunDetail>;
     /** Page durable progress forward, backward, or from the latest tail. */

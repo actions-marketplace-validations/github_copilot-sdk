@@ -1,23 +1,25 @@
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures_util::FutureExt;
 use parking_lot::Mutex as ParkingLotMutex;
 use serde_json::Value;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, warn};
+use tracing::{Instrument, error, warn};
 
 use crate::canvas::CanvasHandler;
 use crate::generated::api_types::{
-    LogRequest, ModelSwitchToRequest, OpenCanvasInstance, RegisterEventInterestParams,
-    ToolsGetCurrentMetadataResult, rpc_methods,
+    LogRequest, ModelSwitchToRequest, OpenCanvasInstance, PermissionDecisionRequest,
+    RegisterEventInterestParams, ToolsGetCurrentMetadataResult, rpc_methods,
 };
 use crate::generated::session_events::{
     CommandExecuteData, ElicitationRequestedData, ExternalToolRequestedData, McpOauthRequiredData,
-    SessionCanvasClosedData, SessionErrorData, SessionEventType,
+    SessionCanvasClosedData, SessionErrorData, SessionEventType, SessionIdleData, SessionMode,
 };
 use crate::handler::{
     AutoModeSwitchHandler, AutoModeSwitchResponse, ElicitationHandler, ExitPlanModeHandler,
@@ -64,6 +66,13 @@ pub(crate) struct SessionHandlers {
     pub exit_plan_mode: Option<Arc<dyn ExitPlanModeHandler>>,
     pub auto_mode_switch: Option<Arc<dyn AutoModeSwitchHandler>>,
     pub tools: Arc<HashMap<String, Arc<dyn crate::tool::ToolHandler>>>,
+}
+
+fn has_managed_settings(
+    enable_managed_settings: Option<bool>,
+    managed_settings: Option<&crate::types::ManagedSettings>,
+) -> bool {
+    enable_managed_settings == Some(true) || managed_settings.is_some()
 }
 
 /// Shared state between a [`Session`] and its event loop, used by [`Session::send_and_wait`].
@@ -183,6 +192,8 @@ pub struct Session {
     open_canvases: Arc<parking_lot::RwLock<Vec<OpenCanvasInstance>>>,
     /// Broadcast channel for runtime event subscribers — see [`Session::subscribe`].
     event_tx: tokio::sync::broadcast::Sender<SessionEvent>,
+    github_token_registration:
+        ParkingLotMutex<Option<crate::github_token::GitHubTokenRegistration>>,
 }
 
 impl Session {
@@ -314,10 +325,15 @@ impl Session {
     /// Stop the internal event loop. Called automatically on [`destroy`](Self::destroy).
     ///
     /// Cooperative: signals shutdown via the session's [`CancellationToken`]
-    /// and awaits the loop's natural exit rather than aborting the task.
-    /// Any in-flight handler (permission callback, tool call, elicitation
-    /// response) completes before the loop exits, so the CLI never sees a
-    /// half-handled request. See RFD-400 review finding #3.
+    /// and awaits the loop's natural exit rather than aborting the task, so
+    /// the loop always stops between iterations instead of at an arbitrary
+    /// await point. See RFD-400 review finding #3.
+    ///
+    /// Inbound requests are dispatched to their own spawned tasks, which this
+    /// call does not await. A handler (permission callback, tool call,
+    /// elicitation response) still running at teardown may therefore outlive
+    /// the loop, and its response can be lost if the connection closes first.
+    /// Await your own handler work before calling this if it must complete.
     pub async fn stop_event_loop(&self) {
         self.shutdown.cancel();
         let handle = self.event_loop.lock().take();
@@ -533,13 +549,21 @@ impl Session {
     pub async fn set_model(&self, model: &str, opts: Option<SetModelOptions>) -> Result<(), Error> {
         let opts = opts.unwrap_or_default();
         let request = ModelSwitchToRequest {
+            auto_tier: None,
+            compaction_decision: None,
+            context_tier: opts.context_tier,
+            defer_if_model_change_queued: None,
+            model_capabilities: opts.model_capabilities,
+            model_change_scope: None,
             model_id: model.to_string(),
+            picker_persistence: None,
             reasoning_effort: opts.reasoning_effort,
             reasoning_summary: opts.reasoning_summary,
+            repo_scope: None,
+            require_available: None,
+            run_compaction_preflight: None,
+            source: None,
             verbosity: None,
-            context_tier: opts.context_tier,
-            model_capabilities: opts.model_capabilities,
-            defer_if_model_change_queued: None,
         };
         self.rpc().model().switch_to(request).await?;
         Ok(())
@@ -570,6 +594,7 @@ impl Session {
             .await?;
         self.stop_event_loop().await;
         self.client.unregister_session(&self.id);
+        self.github_token_registration.lock().take();
         Ok(())
     }
 
@@ -636,17 +661,18 @@ impl Drop for Session {
     fn drop(&mut self) {
         // Cooperative shutdown: cancel the event loop's token to signal
         // exit between iterations. The loop will see the cancellation on
-        // its next select poll and break cleanly without interrupting an
-        // in-flight handler. We do NOT abort the JoinHandle — that would
-        // land at any await point in the loop body, potentially leaving
-        // the CLI with an unanswered request id. RFD-400 review finding
-        // #3.
+        // its next select poll and break cleanly. We do NOT abort the
+        // JoinHandle — that would land at any await point in the loop body,
+        // potentially leaving the CLI with an unanswered request id.
+        // RFD-400 review finding #3. Requests already dispatched to their
+        // own tasks are not tracked here and may outlive the session.
         //
         // The handle itself is left in `event_loop` to be reaped by the
         // tokio runtime when it next polls; we intentionally don't await
         // it here because Drop is sync.
         self.shutdown.cancel();
         self.client.unregister_session(&self.id);
+        self.github_token_registration.lock().take();
     }
 }
 
@@ -852,6 +878,8 @@ impl Client {
         config.system_message =
             crate::mode::system_message_for_mode(mode, config.system_message.take());
         config.memory = crate::mode::memory_for_mode(mode, config.memory.take());
+        config.enable_experimental_mode =
+            crate::mode::experimental_mode_for_mode(mode, config.enable_experimental_mode);
         if mode == crate::ClientMode::Empty {
             if config.enable_session_telemetry.is_none() {
                 config.enable_session_telemetry = Some(false);
@@ -887,6 +915,7 @@ impl Client {
         let opt_custom_agents_local_only = config.custom_agents_local_only;
         let opt_coauthor_enabled = config.coauthor_enabled;
         let opt_manage_schedule_enabled = config.manage_schedule_enabled;
+        let opt_included_builtin_skills = config.included_builtin_skills.take();
         let (mut wire, mut runtime) = config.into_wire(local_session_id.clone())?;
         wire.enable_github_telemetry_forwarding =
             self.inner.on_github_telemetry.is_some().then_some(true);
@@ -897,7 +926,10 @@ impl Client {
         );
         let handlers = SessionHandlers {
             permission: permission_handler,
-            managed_settings_enabled: wire.enable_managed_settings == Some(true),
+            managed_settings_enabled: has_managed_settings(
+                wire.enable_managed_settings,
+                wire.managed_settings.as_ref(),
+            ),
             elicitation: runtime.elicitation_handler.take(),
             mcp_auth: runtime.mcp_auth_handler.take(),
             user_input: runtime.user_input_handler.take(),
@@ -914,6 +946,13 @@ impl Client {
         let canvas_handler = runtime.canvas_handler.take();
         let session_fs_provider = runtime.session_fs_provider.take();
         let bearer_token_providers = std::mem::take(&mut runtime.bearer_token_providers);
+        let github_token_registration = runtime
+            .github_token_provider
+            .take()
+            .map(|provider| self.register_github_token_provider(provider));
+        wire.github_token_provider_registration_id = github_token_registration
+            .as_ref()
+            .map(|registration| registration.id().to_string());
         let has_mcp_auth_handler = handlers.mcp_auth.is_some();
         if self.inner.session_fs_configured && session_fs_provider.is_none() {
             return Err(ErrorKind::Session(SessionErrorKind::SessionFsProviderRequired).into());
@@ -1071,6 +1110,7 @@ impl Client {
             capabilities,
             open_canvases,
             event_tx,
+            github_token_registration: ParkingLotMutex::new(github_token_registration),
         };
         apply_mode_post_create_patch(
             &session,
@@ -1079,8 +1119,14 @@ impl Client {
             opt_custom_agents_local_only,
             opt_coauthor_enabled,
             opt_manage_schedule_enabled,
+            opt_included_builtin_skills,
         )
         .await?;
+        if let Some(registration) = session.github_token_registration.lock().as_ref() {
+            registration.claim(session.id.clone());
+        } else {
+            self.retire_github_token_provider(&session.id);
+        }
         Ok(session)
     }
 
@@ -1120,6 +1166,8 @@ impl Client {
         config.system_message =
             crate::mode::system_message_for_mode(mode, config.system_message.take());
         config.memory = crate::mode::memory_for_mode(mode, config.memory.take());
+        config.enable_experimental_mode =
+            crate::mode::experimental_mode_for_mode(mode, config.enable_experimental_mode);
         if mode == crate::ClientMode::Empty {
             if config.enable_session_telemetry.is_none() {
                 config.enable_session_telemetry = Some(false);
@@ -1155,6 +1203,7 @@ impl Client {
         let opt_custom_agents_local_only = config.custom_agents_local_only;
         let opt_coauthor_enabled = config.coauthor_enabled;
         let opt_manage_schedule_enabled = config.manage_schedule_enabled;
+        let opt_included_builtin_skills = config.included_builtin_skills.take();
         let (mut wire, mut runtime) = config.into_wire()?;
         wire.enable_github_telemetry_forwarding =
             self.inner.on_github_telemetry.is_some().then_some(true);
@@ -1165,7 +1214,10 @@ impl Client {
         );
         let handlers = SessionHandlers {
             permission: permission_handler,
-            managed_settings_enabled: wire.enable_managed_settings == Some(true),
+            managed_settings_enabled: has_managed_settings(
+                wire.enable_managed_settings,
+                wire.managed_settings.as_ref(),
+            ),
             elicitation: runtime.elicitation_handler.take(),
             mcp_auth: runtime.mcp_auth_handler.take(),
             user_input: runtime.user_input_handler.take(),
@@ -1182,6 +1234,13 @@ impl Client {
         let canvas_handler = runtime.canvas_handler.take();
         let session_fs_provider = runtime.session_fs_provider.take();
         let bearer_token_providers = std::mem::take(&mut runtime.bearer_token_providers);
+        let github_token_registration = runtime
+            .github_token_provider
+            .take()
+            .map(|provider| self.register_github_token_provider(provider));
+        wire.github_token_provider_registration_id = github_token_registration
+            .as_ref()
+            .map(|registration| registration.id().to_string());
         let has_mcp_auth_handler = handlers.mcp_auth.is_some();
         if self.inner.session_fs_configured && session_fs_provider.is_none() {
             return Err(ErrorKind::Session(SessionErrorKind::SessionFsProviderRequired).into());
@@ -1326,6 +1385,7 @@ impl Client {
             capabilities,
             open_canvases,
             event_tx,
+            github_token_registration: ParkingLotMutex::new(github_token_registration),
         };
         apply_mode_post_create_patch(
             &session,
@@ -1334,8 +1394,14 @@ impl Client {
             opt_custom_agents_local_only,
             opt_coauthor_enabled,
             opt_manage_schedule_enabled,
+            opt_included_builtin_skills,
         )
         .await?;
+        if let Some(registration) = session.github_token_registration.lock().as_ref() {
+            registration.claim(session.id.clone());
+        } else {
+            self.retire_github_token_provider(&session.id);
+        }
         Ok(session)
     }
 }
@@ -1349,7 +1415,42 @@ async fn apply_mode_post_create_patch(
     opt_custom_agents_local_only: Option<bool>,
     opt_coauthor_enabled: Option<bool>,
     opt_manage_schedule_enabled: Option<bool>,
+    opt_included_builtin_skills: Option<Vec<String>>,
 ) -> Result<(), Error> {
+    let Some(patch) = build_mode_post_create_patch(
+        mode,
+        opt_skip_custom_instructions,
+        opt_custom_agents_local_only,
+        opt_coauthor_enabled,
+        opt_manage_schedule_enabled,
+        opt_included_builtin_skills,
+    ) else {
+        return Ok(());
+    };
+    if let Err(error) = session.rpc().options().update(patch).await {
+        let _ = session.disconnect().await;
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Builds the `session.options.update` patch applied immediately after a session
+/// is created or resumed, or returns `None` when no patch should be sent.
+///
+/// Under [`ClientMode::Empty`](crate::ClientMode::Empty) the overridable feature
+/// flags fall back to safe defaults (caller values win), while
+/// `installed_plugins` is unconditionally empty. `included_builtin_skills`
+/// defaults to an empty list, but callers can explicitly allow selected
+/// runtime-bundled skills. Under other modes only explicitly-set fields are
+/// forwarded.
+fn build_mode_post_create_patch(
+    mode: crate::ClientMode,
+    opt_skip_custom_instructions: Option<bool>,
+    opt_custom_agents_local_only: Option<bool>,
+    opt_coauthor_enabled: Option<bool>,
+    opt_manage_schedule_enabled: Option<bool>,
+    opt_included_builtin_skills: Option<Vec<String>>,
+) -> Option<crate::generated::api_types::SessionUpdateOptionsParams> {
     use crate::generated::api_types::SessionUpdateOptionsParams;
     let mut patch = SessionUpdateOptionsParams::default();
     let should_send = if mode == crate::ClientMode::Empty {
@@ -1358,6 +1459,7 @@ async fn apply_mode_post_create_patch(
         patch.coauthor_enabled = Some(opt_coauthor_enabled.unwrap_or(false));
         patch.manage_schedule_enabled = Some(opt_manage_schedule_enabled.unwrap_or(false));
         patch.installed_plugins = Some(Vec::new());
+        patch.included_builtin_skills = Some(opt_included_builtin_skills.unwrap_or_default());
         true
     } else {
         let mut any = false;
@@ -1377,16 +1479,16 @@ async fn apply_mode_post_create_patch(
             patch.manage_schedule_enabled = Some(v);
             any = true;
         }
+        if let Some(v) = opt_included_builtin_skills {
+            patch.included_builtin_skills = Some(v);
+            any = true;
+        }
         any
     };
     if !should_send {
-        return Ok(());
+        return None;
     }
-    if let Err(error) = session.rpc().options().update(patch).await {
-        let _ = session.disconnect().await;
-        return Err(error);
-    }
-    Ok(())
+    Some(patch)
 }
 
 fn build_command_handler_map(commands: Option<&[CommandDefinition]>) -> Arc<CommandHandlerMap> {
@@ -1473,7 +1575,7 @@ fn spawn_event_loop(
                     _ = shutdown.cancelled() => break,
                     Some(notification) = notifications.recv() => {
                         handle_notification(
-                            &session_id, &client, &handlers, &command_handlers, notification, &idle_waiter, &capabilities, &open_canvases, &event_tx,
+                            &session_id, &client, &handlers, &command_handlers, notification, &idle_waiter, &capabilities, &open_canvases, &event_tx, &shutdown,
                         ).await;
                     }
                     Some(request) = requests.recv() => {
@@ -1489,6 +1591,8 @@ fn spawn_event_loop(
                         let canvas_handler = canvas_handler.clone();
                         let session_fs_provider = session_fs_provider.clone();
                         let bearer_token_providers = bearer_token_providers.clone();
+                        let request_id = request.id;
+                        let method = request.method.clone();
                         tokio::spawn(
                             async move {
                                 let ctx = RequestDispatchContext {
@@ -1500,7 +1604,19 @@ fn spawn_event_loop(
                                     session_fs_provider: session_fs_provider.as_ref(),
                                     bearer_token_providers: &bearer_token_providers,
                                 };
-                                handle_request(&session_id, ctx, request).await;
+                                let dispatch = handle_request(&session_id, ctx, request);
+                                if AssertUnwindSafe(dispatch).catch_unwind().await.is_err() {
+                                    // Tokio isolates the panic to this task, so without a
+                                    // reply the CLI waits out its own timeout on this id.
+                                    error!(method = %method, "request handler panicked");
+                                    let _ = send_error_response(
+                                        &client,
+                                        request_id,
+                                        error_codes::INTERNAL_ERROR,
+                                        "request handler panicked",
+                                    )
+                                    .await;
+                                }
                             }
                             .instrument(span),
                         );
@@ -1556,17 +1672,31 @@ fn permission_request_data(
     }
 }
 
-/// Map a [`PermissionResult`] to the `result` payload sent back to the
-/// server via `session.permissions.handlePendingPermissionRequest`.
+/// Build the full `session.permissions.handlePendingPermissionRequest`
+/// params for a permission result.
+///
+/// `decisionContext` is a sibling of `result` and is only present when the
+/// handler attributed the decision — omitting it preserves legacy behavior.
 ///
 /// Returns `None` when the SDK must not send a response.
-fn notification_permission_payload(result: &PermissionResult) -> Option<Value> {
-    match result {
-        PermissionResult::NoResult => None,
-        PermissionResult::Decision(decision) => Some(
-            serde_json::to_value(decision).expect("serializing permission decision should succeed"),
-        ),
-    }
+fn permission_response_params(
+    session_id: &SessionId,
+    request_id: &RequestId,
+    result: &PermissionResult,
+) -> Option<Value> {
+    let (decision, decision_context) = match result {
+        PermissionResult::Decision { decision, context } => (decision, context.clone()),
+        PermissionResult::NoResult => return None,
+    };
+    let mut params = serde_json::to_value(PermissionDecisionRequest {
+        decision_context,
+        request_id: request_id.clone(),
+        result: decision.clone(),
+    })
+    .expect("serializing permission response should succeed");
+    params["sessionId"] =
+        serde_json::to_value(session_id).expect("serializing session ID should succeed");
+    Some(params)
 }
 
 async fn register_mcp_auth_interest(client: &Client, session_id: &SessionId) -> Result<(), Error> {
@@ -1593,6 +1723,12 @@ fn tool_failure_result(message: impl Into<String>) -> ToolResult {
     })
 }
 
+fn is_autopilot_continuation_idle(event: &SessionEvent) -> bool {
+    event
+        .typed_data::<SessionIdleData>()
+        .is_some_and(|data| data.mode == Some(SessionMode::Autopilot))
+}
+
 /// Process a notification from the CLI's broadcast channel.
 #[allow(clippy::too_many_arguments)]
 async fn handle_notification(
@@ -1605,6 +1741,7 @@ async fn handle_notification(
     capabilities: &Arc<parking_lot::RwLock<SessionCapabilities>>,
     open_canvases: &Arc<parking_lot::RwLock<Vec<OpenCanvasInstance>>>,
     event_tx: &tokio::sync::broadcast::Sender<SessionEvent>,
+    shutdown: &CancellationToken,
 ) {
     let dispatch_start = Instant::now();
     let event = notification.event.clone();
@@ -1637,6 +1774,7 @@ async fn handle_notification(
                         }
                         waiter.last_assistant_message = Some(event.clone());
                     }
+                    SessionEventType::SessionIdle if is_autopilot_continuation_idle(&event) => {}
                     SessionEventType::SessionIdle | SessionEventType::SessionError => {
                         if let Some(waiter) = guard.take() {
                             if event_type == SessionEventType::SessionIdle {
@@ -1741,6 +1879,7 @@ async fn handle_notification(
             };
             let client = client.clone();
             let sid = session_id.clone();
+            let shutdown = shutdown.clone();
             let data = permission_request_data(
                 &notification.event.data,
                 handlers.managed_settings_enabled,
@@ -1762,29 +1901,47 @@ async fn handle_notification(
                         request_id = %request_id,
                         "PermissionHandler::handle dispatch"
                     );
-                    let Some(result_value) = notification_permission_payload(&result) else {
+                    let Some(params) = permission_response_params(&sid, &request_id, &result)
+                    else {
                         // Handler returned Deferred / NoResult — it will
                         // call handlePendingPermissionRequest itself (or
                         // leave the request unanswered).
                         return;
                     };
                     let rpc_start = Instant::now();
-                    let _ = client
-                        .call(
-                            "session.permissions.handlePendingPermissionRequest",
-                            Some(serde_json::json!({
-                                "sessionId": sid,
-                                "requestId": request_id,
-                                "result": result_value,
-                            })),
-                        )
-                        .await;
-                    tracing::debug!(
-                        elapsed_ms = rpc_start.elapsed().as_millis(),
-                        session_id = %sid,
-                        request_id = %request_id,
-                        "Session::handle_notification response sent successfully"
-                    );
+                    let method =
+                        rpc_methods::SESSION_PERMISSIONS_HANDLEPENDINGPERMISSIONREQUEST;
+                    tokio::select! {
+                        biased;
+                        response = client.call(method, Some(params)) => {
+                            match response {
+                                Ok(_) => tracing::debug!(
+                                    elapsed_ms = rpc_start.elapsed().as_millis(),
+                                    session_id = %sid,
+                                    request_id = %request_id,
+                                    method,
+                                    "Session::handle_notification response sent successfully"
+                                ),
+                                Err(error) => warn!(
+                                    error = %error,
+                                    session_id = %sid,
+                                    request_id = %request_id,
+                                    method,
+                                    "failed to deliver permission decision back to the runtime"
+                                ),
+                            }
+                        }
+                        _ = shutdown.cancelled() => {
+                            warn!(
+                                elapsed_ms = rpc_start.elapsed().as_millis(),
+                                session_id = %sid,
+                                request_id = %request_id,
+                                method,
+                                delivery_outcome = "unknown",
+                                "permission confirmation acknowledgement wait cancelled during session shutdown"
+                            );
+                        }
+                    }
                 }
                 .instrument(span),
             );
@@ -2546,31 +2703,232 @@ fn inject_transform_sections_resume(
 mod tests {
     use serde_json::json;
 
-    use super::{notification_permission_payload, permission_request_data};
+    use super::{
+        build_mode_post_create_patch, has_managed_settings, is_autopilot_continuation_idle,
+        permission_request_data, permission_response_params,
+    };
     use crate::handler::PermissionResult;
+    use crate::types::{
+        PermissionDecisionContext, PermissionDecisionOutcome, PermissionDecisionSource,
+        PermissionDecisionSurface, RequestId, SessionEvent, SessionId,
+    };
 
     #[test]
-    fn notification_payload_suppresses_no_result() {
-        assert!(notification_permission_payload(&PermissionResult::NoResult).is_none());
+    fn identifies_only_autopilot_continuation_idles() {
+        let mut event = SessionEvent {
+            id: "event-1".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            parent_id: None,
+            ephemeral: None,
+            agent_id: None,
+            debug_cli_received_at_ms: None,
+            debug_ws_forwarded_at_ms: None,
+            event_type: "session.idle".to_string(),
+            data: json!({ "mode": "autopilot" }),
+        };
+
+        assert!(is_autopilot_continuation_idle(&event));
+
+        event.data = json!({ "mode": "interactive" });
+        assert!(!is_autopilot_continuation_idle(&event));
+
+        event.data = json!({});
+        assert!(!is_autopilot_continuation_idle(&event));
     }
 
     #[test]
-    fn notification_payload_serializes_decisions() {
+    fn empty_mode_post_patch_sets_empty_included_builtin_skills() {
+        let patch =
+            build_mode_post_create_patch(crate::ClientMode::Empty, None, None, None, None, None)
+                .expect("empty mode always sends a patch");
         assert_eq!(
-            notification_permission_payload(&PermissionResult::approve_once()),
-            Some(json!({ "kind": "approve-once" }))
+            patch.included_builtin_skills,
+            Some(Vec::new()),
+            "empty mode must fail closed with an empty includedBuiltinSkills list"
         );
+        assert_eq!(patch.installed_plugins.as_ref().map(|p| p.len()), Some(0));
+        // Serializes as an explicit empty array (not omitted).
+        let value = serde_json::to_value(&patch).expect("serialize patch");
+        assert_eq!(value["includedBuiltinSkills"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn empty_mode_post_patch_preserves_explicit_builtin_skill_allowlist() {
+        let patch = build_mode_post_create_patch(
+            crate::ClientMode::Empty,
+            Some(false),
+            Some(false),
+            Some(true),
+            Some(true),
+            Some(vec!["code-review".to_string()]),
+        )
+        .expect("empty mode always sends a patch");
         assert_eq!(
-            notification_permission_payload(&PermissionResult::reject(None)),
-            Some(json!({ "kind": "reject" }))
+            patch.included_builtin_skills,
+            Some(vec!["code-review".to_string()])
         );
-        assert_eq!(
-            notification_permission_payload(&PermissionResult::reject(Some("bad".to_string()))),
-            Some(json!({ "kind": "reject", "feedback": "bad" }))
+    }
+
+    #[test]
+    fn copilot_cli_mode_does_not_inject_included_builtin_skills() {
+        // No fields set -> no patch at all.
+        assert!(
+            build_mode_post_create_patch(
+                crate::ClientMode::CopilotCli,
+                None,
+                None,
+                None,
+                None,
+                None
+            )
+            .is_none()
         );
+        // A field set -> patch sent, but skills field stays absent.
+        let patch = build_mode_post_create_patch(
+            crate::ClientMode::CopilotCli,
+            Some(true),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("a set field triggers a patch");
+        assert_eq!(patch.included_builtin_skills, None);
+        assert!(patch.installed_plugins.is_none());
+        let value = serde_json::to_value(&patch).expect("serialize patch");
+        assert!(value.get("includedBuiltinSkills").is_none());
+
+        let patch = build_mode_post_create_patch(
+            crate::ClientMode::CopilotCli,
+            None,
+            None,
+            None,
+            None,
+            Some(vec!["code-review".to_string()]),
+        )
+        .expect("an explicit allowlist triggers a patch");
         assert_eq!(
-            notification_permission_payload(&PermissionResult::user_not_available()),
-            Some(json!({ "kind": "user-not-available" }))
+            patch.included_builtin_skills,
+            Some(vec!["code-review".to_string()])
+        );
+    }
+
+    #[test]
+    fn direct_injection_enables_managed_safeguards() {
+        let settings = crate::types::ManagedSettings::default();
+        assert!(has_managed_settings(None, Some(&settings)));
+        assert!(!has_managed_settings(None, None));
+    }
+
+    fn attribution_context() -> PermissionDecisionContext {
+        PermissionDecisionContext {
+            outcome: PermissionDecisionOutcome::AutoApproved,
+            response_capability: None,
+            source: PermissionDecisionSource::AssistedApproval,
+            surface: PermissionDecisionSurface::CopilotApp,
+        }
+    }
+
+    #[test]
+    fn response_params_omit_decision_context_without_attribution() {
+        for (result, expected) in [
+            (
+                PermissionResult::approve_once(),
+                json!({ "kind": "approve-once" }),
+            ),
+            (PermissionResult::reject(None), json!({ "kind": "reject" })),
+            (
+                PermissionResult::reject(Some("bad".to_string())),
+                json!({ "kind": "reject", "feedback": "bad" }),
+            ),
+            (
+                PermissionResult::user_not_available(),
+                json!({ "kind": "user-not-available" }),
+            ),
+        ] {
+            let params = permission_response_params(
+                &SessionId::from("session-1"),
+                &RequestId::from("permission-1"),
+                &result,
+            )
+            .unwrap();
+            assert_eq!(
+                params,
+                json!({
+                    "sessionId": "session-1",
+                    "requestId": "permission-1",
+                    "result": expected,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn response_params_forward_decision_context_alongside_result() {
+        let params = permission_response_params(
+            &SessionId::from("session-1"),
+            &RequestId::from("permission-1"),
+            &PermissionResult::approve_once().with_context(attribution_context()),
+        )
+        .unwrap();
+        assert_eq!(
+            params,
+            json!({
+                "sessionId": "session-1",
+                "requestId": "permission-1",
+                "result": { "kind": "approve-once" },
+                "decisionContext": {
+                    "outcome": "auto_approved",
+                    "source": "assisted_approval",
+                    "surface": "copilot_app",
+                },
+            })
+        );
+        // The context is a sibling of `result`, never nested inside it.
+        assert!(params["result"].get("decisionContext").is_none());
+    }
+
+    #[test]
+    fn response_params_suppressed_for_no_result() {
+        assert!(
+            permission_response_params(
+                &SessionId::from("session-1"),
+                &RequestId::from("permission-1"),
+                &PermissionResult::NoResult,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn with_context_is_a_no_op_on_no_result() {
+        let result = PermissionResult::no_result().with_context(attribution_context());
+        assert!(matches!(result, PermissionResult::NoResult));
+    }
+
+    #[test]
+    fn with_context_replaces_rather_than_nests() {
+        let result = PermissionResult::approve_once()
+            .with_context(attribution_context())
+            .with_context(PermissionDecisionContext {
+                outcome: PermissionDecisionOutcome::PromptedUser,
+                response_capability: None,
+                source: PermissionDecisionSource::HumanResponse,
+                surface: PermissionDecisionSurface::Sdk,
+            });
+        let params = permission_response_params(
+            &SessionId::from("session-1"),
+            &RequestId::from("permission-1"),
+            &result,
+        )
+        .unwrap();
+        assert_eq!(
+            params["decisionContext"],
+            json!({
+                "outcome": "prompted_user",
+                "source": "human_response",
+                "surface": "sdk",
+            })
         );
     }
 

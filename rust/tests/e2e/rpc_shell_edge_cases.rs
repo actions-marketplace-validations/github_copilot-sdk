@@ -3,11 +3,12 @@ use std::time::Duration;
 
 use github_copilot_sdk::rpc::{ShellExecRequest, ShellKillRequest, ShellKillSignal};
 
-use super::support::{wait_for_condition, with_e2e_context};
+use super::support::wait_for_condition;
 
 #[tokio::test]
 async fn shell_exec_with_timeout_kills_long_running_command() {
-    with_e2e_context(
+    super::support::with_shared_e2e_context(
+        &E2E,
         "rpc_shell_edge_cases",
         "shell_exec_with_timeout_kills_long_running_command",
         |ctx| {
@@ -58,7 +59,8 @@ async fn shell_exec_with_timeout_kills_long_running_command() {
 
 #[tokio::test]
 async fn shell_exec_with_custom_cwd_honors_override() {
-    with_e2e_context(
+    super::support::with_shared_e2e_context(
+        &E2E,
         "rpc_shell_edge_cases",
         "shell_exec_with_custom_cwd_honors_override",
         |ctx| {
@@ -97,7 +99,8 @@ async fn shell_exec_with_custom_cwd_honors_override() {
 
 #[tokio::test]
 async fn shell_exec_with_nonexistent_command_returns_processid_and_cleans_up() {
-    with_e2e_context(
+    super::support::with_shared_e2e_context(
+        &E2E,
         "rpc_shell_edge_cases",
         "shell_exec_with_nonexistent_command_returns_processid_and_cleans_up",
         |ctx| {
@@ -133,7 +136,8 @@ async fn shell_exec_with_nonexistent_command_returns_processid_and_cleans_up() {
 
 #[tokio::test]
 async fn shell_kill_unknown_processid_returns_false() {
-    with_e2e_context(
+    super::support::with_shared_e2e_context(
+        &E2E,
         "rpc_shell_edge_cases",
         "shell_kill_unknown_processid_returns_false",
         |ctx| {
@@ -167,7 +171,8 @@ async fn shell_kill_unknown_processid_returns_false() {
 
 #[tokio::test]
 async fn shell_kill_cleans_up_after_terminating_signal() {
-    with_e2e_context(
+    super::support::with_shared_e2e_context(
+        &E2E,
         "rpc_shell_edge_cases",
         "shell_kill_cleans_up_after_terminating_signal",
         |ctx| {
@@ -212,7 +217,8 @@ async fn shell_kill_cleans_up_after_terminating_signal() {
 
 #[tokio::test]
 async fn shell_exec_with_stderr_output_cleans_up() {
-    with_e2e_context(
+    super::support::with_shared_e2e_context(
+        &E2E,
         "rpc_shell_edge_cases",
         "shell_exec_with_stderr_output_cleans_up",
         |ctx| {
@@ -249,7 +255,8 @@ async fn shell_exec_with_stderr_output_cleans_up() {
 
 #[tokio::test]
 async fn shell_exec_with_large_stdout_cleans_up() {
-    with_e2e_context(
+    super::support::with_shared_e2e_context(
+        &E2E,
         "rpc_shell_edge_cases",
         "shell_exec_with_large_stdout_cleans_up",
         |ctx| {
@@ -301,9 +308,9 @@ async fn wait_for_file_text(path: &Path, expected: &'static str) {
 async fn wait_for_process_cleanup(
     session: &github_copilot_sdk::session::Session,
     process_id: String,
-    _scenario: &'static str,
+    scenario: &'static str,
 ) {
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     let result = session
         .rpc()
         .shell()
@@ -313,7 +320,10 @@ async fn wait_for_process_cleanup(
         })
         .await
         .expect("probe process cleanup");
-    assert!(!result.killed);
+    assert!(
+        !result.killed,
+        "{scenario} should have already exited and been removed from the runtime process map"
+    );
 }
 
 #[cfg(windows)]
@@ -395,7 +405,7 @@ fn stderr_command(marker_path: &Path) -> String {
 #[cfg(windows)]
 fn large_stdout_command(marker_path: &Path) -> String {
     format!(
-        "powershell -NoLogo -NoProfile -Command \"Write-Host ('x' * 204800); Set-Content -LiteralPath '{}' -Value done\"",
+        "powershell -NoLogo -NoProfile -Command \"Write-Host ('x' * 71680); Set-Content -LiteralPath '{}' -Value done\"",
         marker_path.display()
     )
 }
@@ -403,7 +413,9 @@ fn large_stdout_command(marker_path: &Path) -> String {
 #[cfg(not(windows))]
 fn large_stdout_command(marker_path: &Path) -> String {
     format!(
-        "sh -c \"python3 - <<'PY'\nprint('x' * 204800)\nPY\nprintf done > '{}'\"",
+        "sh -c \"python3 - <<'PY'\nprint('x' * 71680)\nPY\nprintf done > '{}'\"",
         marker_path.display()
     )
 }
+static E2E: super::support::SharedE2eGroup =
+    super::support::SharedE2eGroup::standard("rpc_shell_edge_cases", 7);

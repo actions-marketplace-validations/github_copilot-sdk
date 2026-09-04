@@ -259,6 +259,14 @@ def _custom_agents_local_only_default(
     return _empty_mode_bool_default(mode, supplied, True)
 
 
+def _enable_experimental_mode_default(
+    mode: CopilotClientMode | None,
+    supplied: bool | None,
+) -> bool | None:
+    """Empty mode defaults experimental mode to False; caller value wins."""
+    return _empty_mode_bool_default(mode, supplied, False)
+
+
 def _mcp_oauth_token_storage_default(
     mode: CopilotClientMode | None,
     supplied: Literal["persistent", "in-memory"] | None,
@@ -290,11 +298,14 @@ def _post_create_options_patch(
     custom_agents_local_only: bool | None,
     coauthor_enabled: bool | None,
     manage_schedule_enabled: bool | None,
+    included_builtin_skills: list[str] | None = None,
 ) -> dict[str, Any] | None:
     """Build the patch sent via ``session.options.update`` after create/resume.
 
     In empty mode the four overridable flags default to safe values
     (caller-supplied values win); ``installedPlugins=[]`` is unconditional.
+    ``includedBuiltinSkills`` defaults to an empty list, but callers can
+    explicitly allow selected runtime-bundled skills.
     Returns ``None`` if no patch should be sent.
     """
     if mode == "empty":
@@ -310,6 +321,9 @@ def _post_create_options_patch(
                 manage_schedule_enabled if manage_schedule_enabled is not None else False
             ),
             "installedPlugins": [],
+            "includedBuiltinSkills": (
+                included_builtin_skills if included_builtin_skills is not None else []
+            ),
         }
         return patch
     patch = {}
@@ -321,6 +335,8 @@ def _post_create_options_patch(
         patch["coauthorEnabled"] = coauthor_enabled
     if manage_schedule_enabled is not None:
         patch["manageScheduleEnabled"] = manage_schedule_enabled
+    if included_builtin_skills is not None:
+        patch["includedBuiltinSkills"] = included_builtin_skills
     return patch or None
 
 

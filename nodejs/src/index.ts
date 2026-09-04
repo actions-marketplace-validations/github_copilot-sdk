@@ -9,7 +9,7 @@
  */
 
 export { CopilotClient } from "./client.js";
-export { RuntimeConnection } from "./types.js";
+export { DisableBypassPermissionsModes, RuntimeConnection } from "./types.js";
 export { BuiltInTools, ToolSet } from "./toolSet.js";
 export { CopilotSession, type AssistantMessageEvent } from "./session.js";
 export { defineFactory, FactoryResumeError, isFactoryRunTerminal } from "./factory.js";
@@ -27,6 +27,7 @@ export {
 export {
     defineTool,
     approveAll,
+    createAttributedPermissionResult,
     convertMcpCallToolResult,
     createSessionFsAdapter,
     CopilotRequestHandler,
@@ -41,16 +42,18 @@ export {
 // consumers can import them directly from "@github/copilot-sdk" instead of
 // reaching into the package's internal dist layout. See issue #1156.
 //
-// Five names from this file are also explicitly exported elsewhere in this
+// Six names from this file are also explicitly exported elsewhere in this
 // module — `SessionEvent` (re-exported below from `./types.js`),
 // `PermissionRequest` (re-exported below from `./types.js`),
 // `PermissionRequestedData`/`PermissionRequestedEvent` (also re-exported below
-// from `./types.js`), and `AssistantMessageEvent` (re-exported above from
-// `./session.js`). Per the ECMAScript module spec, the explicit named re-exports
+// from `./types.js`), `AssistantMessageEvent` (re-exported above from
+// `./session.js`), and `JsonValue` (re-exported below from `./factory.js`).
+// Per the ECMAScript module spec, the explicit named re-exports
 // shadow the names arriving via `export type *`, so the hand-authored public API
-// surface for those five identifiers is preserved unchanged.
+// surface for those six identifiers is preserved unchanged.
 export type * from "./generated/session-events.js";
 export type {
+    AskUserVariant,
     CommandContext,
     CommandDefinition,
     CommandHandler,
@@ -63,6 +66,10 @@ export type {
     AgentStopHandler,
     AgentStopHookInput,
     AgentStopHookOutput,
+    UserPromptTransformedHandler,
+    UserPromptTransformedHookInput,
+    UserPromptTransformedHookOutput,
+    CopilotClientInfo,
     CopilotClientMode,
     CopilotClientOptions,
     CopilotExpAssignmentResponse,
@@ -92,6 +99,11 @@ export type {
     GitHubTelemetryNotification,
     GitHubTelemetryEvent,
     GitHubTelemetryClientInfo,
+    GitHubTokenAcquireReason,
+    GitHubTokenAcquireResult,
+    GitHubTokenProvider,
+    GitHubTokenProviderArgs,
+    GitHubTokenProviderResult,
     InfiniteSessionConfig,
     LargeToolOutputConfig,
     MemoryConfiguration,
@@ -104,9 +116,12 @@ export type {
     DefaultAgentConfig,
     BearerTokenProvider,
     MessageOptions,
+    ManagedSettings,
+    ManagedSettingsPermissions,
     ModelBilling,
     ModelBillingTokenPrices,
     ModelBillingTokenPricesLongContext,
+    AutoTier,
     CapiSessionOptions,
     ModelCapabilities,
     ModelCapabilitiesOverride,
@@ -118,6 +133,12 @@ export type {
     PermissionRequestedData,
     PermissionRequestedEvent,
     PermissionRequestResult,
+    AttributedPermissionResult,
+    PermissionDecisionContext,
+    PermissionDecisionOutcome,
+    PermissionDecisionSource,
+    PermissionDecisionSurface,
+    PermissionResponseCapability,
     ProviderConfig,
     ProviderModelConfig,
     ProviderTokenArgs,
@@ -191,6 +212,8 @@ export type {
     FactoryRunResult,
     FactoryRunStatus,
     FactoryRunSummary,
+    FactoryListRunsOptions,
+    FactoryRunsPage,
     FactoryRunDetail,
     FactoryProgressPage,
     FactoryProgressLine,
