@@ -7680,6 +7680,7 @@ internal sealed class ModelSwitchAutoTierRequest
 {
     /// <summary>Auto preference to activate when a future user turn using the `auto` model safely mints a replacement model and token pair. Pass null to return to provider-default Auto routing.</summary>
     [JsonPropertyName("autoTier")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.Never)]
     public AutoTier? AutoTier { get; set; }
 
     /// <summary>Target session identifier.</summary>
