@@ -3526,6 +3526,7 @@ export interface ModelCapabilities {
     };
     limits: {
         max_prompt_tokens?: number;
+        max_output_tokens?: number;
         max_context_window_tokens: number;
         vision?: {
             supported_media_types: string[];
