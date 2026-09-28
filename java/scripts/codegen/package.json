@@ -10,6 +10,6 @@
   },
   "dependencies": {
     "json-schema": "^0.4.0",
-    "tsx": "^4.23.13"
+    "tsx": "^4.23.15"
   }
 }
